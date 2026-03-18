@@ -1,0 +1,22 @@
+[project]
+name = "ald-checker"
+version = "0.1.0"
+description = "ALD output quality checker — validates and fixes asset location CSVs"
+requires-python = ">=3.13"
+dependencies = [
+    "cleanco>=2.3",
+]
+
+[project.optional-dependencies]
+llm = ["litellm>=1.0"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+ald-check = "ald_checker.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
