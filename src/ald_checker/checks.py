@@ -105,7 +105,11 @@ def check_asset_id_unique(rows: list[dict], fix: bool = False, **_kw) -> CheckRe
                 result.fix(f"Row {i}: generated asset_id {row['asset_id']}")
             continue
         if aid in seen:
-            result.fail(f"Duplicate asset_id '{aid}' at rows {seen[aid]} and {i}")
+            if fix:
+                row["asset_id"] = str(uuid.uuid4())
+                result.fix(f"Row {i}: regenerated duplicate asset_id (was '{aid}')")
+            else:
+                result.fail(f"Duplicate asset_id '{aid}' at rows {seen[aid]} and {i}")
         else:
             seen[aid] = i
 
