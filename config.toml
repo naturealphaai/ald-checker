@@ -28,3 +28,6 @@ xlsx = true
 
 # Default attribution source when missing
 # default_attribution = ""
+
+# Reverse geocode to fill missing addresses (requires GOOGLE_MAPS_API_KEY in .env)
+reverse_geocode = true

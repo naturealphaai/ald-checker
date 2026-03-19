@@ -1026,29 +1026,41 @@ def check_address_exists(rows: list[dict], fix: bool = False, **_kw) -> CheckRes
         return result
 
     if fix and missing:
+        # Check config — reverse geocoding can be disabled
+        if not CONFIG.get("checks", {}).get("reverse_geocode", True):
+            result.warn(f"{len(missing)} rows missing address (reverse_geocode disabled in config)")
+            return result
+
         fixed = 0
-        # Try geo-resolve first (uses Google API key from .env)
-        try:
-            from geo_resolve import reverse_geocode
+        import urllib.request
+
+        # Try Google reverse geocode first (returns English addresses)
+        google_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if google_key:
             for i in missing:
                 row = rows[i]
                 lat, lon = row.get("latitude"), row.get("longitude")
                 try:
-                    addr = reverse_geocode(float(lat), float(lon))
-                    if addr:
-                        rows[i]["address"] = addr
-                        fixed += 1
+                    url = (f"https://maps.googleapis.com/maps/api/geocode/json"
+                           f"?latlng={lat},{lon}&language=en&key={google_key}")
+                    req = urllib.request.Request(url)
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    data = json.loads(resp.read())
+                    if data.get("results"):
+                        addr = data["results"][0].get("formatted_address", "")
+                        if addr:
+                            rows[i]["address"] = addr
+                            fixed += 1
                 except Exception:
                     pass
-        except ImportError:
-            # Fallback to Nominatim if geo-resolve not installed
-            import urllib.request
+        else:
+            # Fallback to Nominatim (local language, rate limited)
             import time
             for i in missing[:50]:
                 row = rows[i]
                 lat, lon = row.get("latitude"), row.get("longitude")
                 try:
-                    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+                    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&accept-language=en"
                     req = urllib.request.Request(url, headers={"User-Agent": "ald-checker/1.0"})
                     resp = urllib.request.urlopen(req, timeout=10)
                     data = json.loads(resp.read())
