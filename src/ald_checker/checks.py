@@ -78,9 +78,64 @@ def _try_llm_import():
 
 # ── Check functions ──────────────────────────────────────────────────────────
 
-def check_columns(rows: list[dict], headers: list[str]) -> CheckResult:
-    """All expected ALD columns exist."""
+COLUMN_ALIASES = {
+    "location": "address",
+    "addr": "address",
+    "full_address": "address",
+    "lat": "latitude",
+    "lng": "longitude",
+    "lon": "longitude",
+    "long": "longitude",
+    "type": "asset_type_raw",
+    "asset_type": "asset_type_raw",
+    "raw_type": "asset_type_raw",
+    "naturesense": "naturesense_asset_type",
+    "ns_type": "naturesense_asset_type",
+    "gics": "industry_code",
+    "gics_code": "industry_code",
+    "isin": "entity_isin",
+    "parent": "parent_name",
+    "stake": "entity_stake_pct",
+    "stake_pct": "entity_stake_pct",
+    "source": "attribution_source",
+    "date": "date_researched",
+    "details": "supplementary_details",
+    "url": "source_url",
+}
+
+
+def check_columns(rows: list[dict], headers: list[str], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """All expected ALD columns exist. Fix renames aliases, drops blanks, adds missing."""
     result = CheckResult("all_columns_exist")
+
+    if fix:
+        # Remove blank column names
+        blank_cols = [h for h in headers if not h or not h.strip()]
+        if blank_cols:
+            for row in rows:
+                for blank in blank_cols:
+                    row.pop(blank, None)
+            headers[:] = [h for h in headers if h and h.strip()]
+            result.fix(f"Removed {len(blank_cols)} blank column(s)")
+
+        # Rename aliases
+        for old_name, new_name in COLUMN_ALIASES.items():
+            if old_name in headers and new_name not in headers:
+                idx = headers.index(old_name)
+                headers[idx] = new_name
+                for row in rows:
+                    if old_name in row:
+                        row[new_name] = row.pop(old_name)
+                result.fix(f"Renamed column '{old_name}' → '{new_name}'")
+
+        # Add missing columns with empty values
+        missing = [c for c in ALD_COLUMNS if c not in headers]
+        for col in missing:
+            headers.append(col)
+            for row in rows:
+                row[col] = ""
+            result.fix(f"Added missing column '{col}'")
+
     missing = [c for c in ALD_COLUMNS if c not in headers]
     extra = [c for c in headers if c not in ALD_COLUMNS and c not in EXTRA_COLUMNS]
     if missing:
@@ -90,9 +145,280 @@ def check_columns(rows: list[dict], headers: list[str]) -> CheckResult:
     return result
 
 
+def _load_type_mappings() -> dict[str, dict]:
+    """Load asset_type_raw → (NS, GICS) mappings from corp-graph."""
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        import os
+        db_url = os.environ.get("CORPGRAPH_DB_URL", "postgresql://corpgraph:corpgraph@localhost:5432/corpgraph")
+        conn = psycopg.connect(db_url, row_factory=dict_row)
+        cur = conn.execute("SELECT raw_type, naturesense_asset_type, industry_code FROM asset_type_mappings")
+        mappings = {row["raw_type"]: {"ns": row["naturesense_asset_type"], "gics": row["industry_code"]} for row in cur.fetchall()}
+        conn.close()
+        return mappings
+    except Exception:
+        return {}
+
+
+def _save_type_mapping(raw_type: str, ns: str, gics: str, source: str = "llm"):
+    """Save a new mapping back to corp-graph."""
+    try:
+        import psycopg
+        import os
+        db_url = os.environ.get("CORPGRAPH_DB_URL", "postgresql://corpgraph:corpgraph@localhost:5432/corpgraph")
+        conn = psycopg.connect(db_url, autocommit=True)
+        conn.execute(
+            "INSERT INTO asset_type_mappings (raw_type, naturesense_asset_type, industry_code, source) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (raw_type) DO UPDATE SET "
+            "naturesense_asset_type = EXCLUDED.naturesense_asset_type, "
+            "industry_code = EXCLUDED.industry_code, updated_at = NOW()",
+            (raw_type, ns, gics, source),
+        )
+        conn.close()
+    except Exception:
+        pass
+
+
+def check_none_strings(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """Convert literal 'None', 'null', 'N/A', 'nan' strings to empty across all columns."""
+    result = CheckResult("none_strings")
+    NONE_VALUES = {"None", "null", "N/A", "nan", "NaN", "none", "NULL", "n/a", "NA"}
+    count = 0
+    if fix:
+        for row in rows:
+            for key in row:
+                if row[key] in NONE_VALUES:
+                    row[key] = ""
+                    count += 1
+        if count:
+            result.fix(f"Cleared {count} None/null/N-A strings across all columns")
+    else:
+        for row in rows:
+            for key in row:
+                if row[key] in NONE_VALUES:
+                    count += 1
+        if count:
+            result.fail(f"{count} None/null/N-A strings found across all columns")
+    return result
+
+
+def check_numeric_cleanup(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """Strip '.0' suffix from numeric string columns (industry_code, entity_stake_pct)."""
+    result = CheckResult("numeric_cleanup")
+    NUMERIC_COLS = ["industry_code", "entity_stake_pct"]
+    count = 0
+    for row in rows:
+        for col in NUMERIC_COLS:
+            val = row.get(col, "")
+            if isinstance(val, str) and val.endswith(".0"):
+                if fix:
+                    row[col] = val[:-2]
+                count += 1
+            elif isinstance(val, float):
+                if fix:
+                    row[col] = str(int(val)) if val == int(val) else str(val)
+                count += 1
+    if fix and count:
+        result.fix(f"Cleaned {count} numeric values (stripped .0 suffix)")
+    elif count:
+        result.fail(f"{count} numeric values have .0 suffix")
+    return result
+
+
+def check_asset_type_raw_standardize(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Standardize asset_type_raw values — fix typos, normalize format."""
+    result = CheckResult("asset_type_raw_standardize")
+
+    # Get unique raw types
+    raw_types: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        raw = row.get("asset_type_raw", "").strip()
+        if raw:
+            raw_types.setdefault(raw, []).append(i)
+
+    if not fix_llm:
+        return result  # Nothing to check in non-fix mode
+
+    # Load known mappings — if a raw type (lowered) is already known, standardize to that form
+    mappings = _load_type_mappings()
+    known_lower = {k.lower(): k for k in mappings}
+
+    still_unknown = {}
+    for raw, idxs in raw_types.items():
+        if raw.lower() in known_lower:
+            canonical = known_lower[raw.lower()]
+            if raw != canonical:
+                for idx in idxs:
+                    rows[idx]["asset_type_raw"] = canonical
+                result.fix(f"'{raw}' → '{canonical}' at {len(idxs)} rows")
+        else:
+            still_unknown[raw] = idxs
+
+    # LLM standardize unknown types
+    if still_unknown:
+        llm = _try_llm_import()
+        if llm:
+            unique_types = list(still_unknown.keys())
+            try:
+                standardized = llm.standardize_raw_types(unique_types, model=model)
+                for original, cleaned in standardized.items():
+                    if original in still_unknown and cleaned != original:
+                        for idx in still_unknown[original]:
+                            rows[idx]["asset_type_raw"] = cleaned
+                        result.fix(f"LLM: '{original}' → '{cleaned}' at {len(still_unknown[original])} rows")
+            except Exception as e:
+                result.fail(f"LLM standardization failed: {e}")
+
+    return result
+
+
+def check_naturesense_correct(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """NatureSense is correct for the asset_type_raw (not just valid)."""
+    result = CheckResult("naturesense_correct")
+    mappings = _load_type_mappings()
+
+    wrong: dict[str, list[int]] = {}  # (raw, current_ns, expected_ns) -> idxs
+    unknown_raw: dict[str, list[int]] = {}
+
+    for i, row in enumerate(rows):
+        raw = row.get("asset_type_raw", "").strip().lower()
+        ns = row.get("naturesense_asset_type", "").strip()
+        if not raw or not ns:
+            continue
+
+        if raw in mappings:
+            expected_ns = mappings[raw]["ns"]
+            if ns != expected_ns:
+                key = (raw, ns, expected_ns)
+                wrong.setdefault(key, []).append(i)
+        else:
+            unknown_raw.setdefault(raw, []).append(i)
+
+    if not fix and not fix_llm:
+        for (raw, current, expected), idxs in wrong.items():
+            result.fail(f"'{raw}': NS is '{current}' but should be '{expected}' at {len(idxs)} rows")
+        return result
+
+    # Fix known wrong mappings
+    for (raw, current, expected), idxs in wrong.items():
+        for idx in idxs:
+            rows[idx]["naturesense_asset_type"] = expected
+        result.fix(f"'{raw}': '{current}' → '{expected}' at {len(idxs)} rows")
+
+    # For unknown raw types, use LLM to determine correct NS and save to corp-graph
+    if unknown_raw and fix_llm:
+        llm = _try_llm_import()
+        if llm:
+            try:
+                raw_list = list(unknown_raw.keys())
+                ns_results = llm.classify_naturesense(raw_list, model=model)
+                for raw, ns_result in ns_results.items():
+                    if raw in unknown_raw and ns_result in VALID_NATURESENSE:
+                        for idx in unknown_raw[raw]:
+                            rows[idx]["naturesense_asset_type"] = ns_result
+                        result.fix(f"LLM: '{raw}' → NS='{ns_result}' at {len(unknown_raw[raw])} rows")
+                        gics = rows[unknown_raw[raw][0]].get("industry_code", "")
+                        if gics:
+                            _save_type_mapping(raw, ns_result, gics, "llm")
+            except Exception:
+                pass
+
+    return result
+
+
+def check_gics_correct(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """GICS is correct for the asset_type_raw (not just valid)."""
+    result = CheckResult("gics_correct")
+    mappings = _load_type_mappings()
+
+    wrong: dict[str, list[int]] = {}
+    unknown_raw: dict[str, list[int]] = {}
+
+    for i, row in enumerate(rows):
+        raw = row.get("asset_type_raw", "").strip().lower()
+        gics = str(row.get("industry_code", "")).strip()
+        if not raw or not gics or gics == "None":
+            continue
+
+        if raw in mappings:
+            expected_gics = mappings[raw]["gics"]
+            if gics != expected_gics:
+                key = (raw, gics, expected_gics)
+                wrong.setdefault(key, []).append(i)
+        else:
+            unknown_raw.setdefault(raw, []).append(i)
+
+    if not fix and not fix_llm:
+        for (raw, current, expected), idxs in wrong.items():
+            result.fail(f"'{raw}': GICS is '{current}' but should be '{expected}' at {len(idxs)} rows")
+        return result
+
+    # Fix known wrong
+    for (raw, current, expected), idxs in wrong.items():
+        for idx in idxs:
+            rows[idx]["industry_code"] = expected
+        result.fix(f"'{raw}': GICS '{current}' → '{expected}' at {len(idxs)} rows")
+
+    # LLM for unknown
+    if unknown_raw and fix_llm:
+        llm = _try_llm_import()
+        if llm:
+            try:
+                raw_list = list(unknown_raw.keys())
+                gics_results = llm.classify_gics(raw_list, model=model)
+                for raw, gics_result in gics_results.items():
+                    if raw in unknown_raw and gics_result in VALID_GICS:
+                        for idx in unknown_raw[raw]:
+                            rows[idx]["industry_code"] = gics_result
+                        result.fix(f"LLM: '{raw}' → GICS='{gics_result}' at {len(unknown_raw[raw])} rows")
+                        ns = rows[unknown_raw[raw][0]].get("naturesense_asset_type", "")
+                        if ns:
+                            _save_type_mapping(raw, ns, gics_result, "llm")
+            except Exception:
+                pass
+
+    return result
+
+
+def _load_asset_id_registry() -> dict[str, dict]:
+    """Load asset_id registry from corp-graph. Returns {asset_id: {source, entity_isin}}."""
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        import os
+        db_url = os.environ.get("CORPGRAPH_DB_URL", "postgresql://corpgraph:corpgraph@localhost:5432/corpgraph")
+        conn = psycopg.connect(db_url, row_factory=dict_row)
+        cur = conn.execute("SELECT asset_id, source, entity_isin FROM asset_id_registry")
+        registry = {row["asset_id"]: {"source": row["source"], "isin": row.get("entity_isin", "")} for row in cur.fetchall()}
+        conn.close()
+        return registry
+    except Exception:
+        return {}
+
+
+def _generate_unique_id(registry: dict) -> str:
+    """Generate a UUID that doesn't collide with the registry."""
+    for _ in range(10):
+        new_id = str(uuid.uuid4())
+        if new_id not in registry:
+            return new_id
+    return str(uuid.uuid4())  # Astronomically unlikely to still collide
+
+
+def _coords_similar(row_a: dict, isin_b: str, registry_entry: dict) -> bool:
+    """Check if a row likely matches a registry entry (same company)."""
+    row_isin = row_a.get("entity_isin", "")
+    reg_isin = registry_entry.get("isin", "")
+    if row_isin and reg_isin and row_isin == reg_isin:
+        return True
+    return False
+
+
 def check_asset_id_unique(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
-    """All asset_ids are unique, non-empty UUIDs."""
+    """All asset_ids are unique, non-empty UUIDs. Cross-checks against corp-graph registry."""
     result = CheckResult("asset_id_unique")
+    registry = _load_asset_id_registry()
     seen: dict[str, int] = {}
     empty_rows = []
 
@@ -101,17 +427,35 @@ def check_asset_id_unique(rows: list[dict], fix: bool = False, **_kw) -> CheckRe
         if not aid:
             empty_rows.append(i)
             if fix:
-                row["asset_id"] = str(uuid.uuid4())
+                row["asset_id"] = _generate_unique_id(registry)
                 result.fix(f"Row {i}: generated asset_id {row['asset_id']}")
             continue
+
+        # Check for in-file duplicates
         if aid in seen:
             if fix:
-                row["asset_id"] = str(uuid.uuid4())
+                row["asset_id"] = _generate_unique_id(registry)
                 result.fix(f"Row {i}: regenerated duplicate asset_id (was '{aid}')")
             else:
                 result.fail(f"Duplicate asset_id '{aid}' at rows {seen[aid]} and {i}")
-        else:
-            seen[aid] = i
+            continue
+
+        seen[aid] = i
+
+        # Cross-check against registry
+        if aid in registry:
+            reg = registry[aid]
+            row_isin = row.get("entity_isin", "")
+            reg_isin = reg.get("isin", "")
+
+            if row_isin and reg_isin and row_isin != reg_isin:
+                # ID belongs to a DIFFERENT company
+                if fix:
+                    row["asset_id"] = _generate_unique_id(registry)
+                    result.fix(f"Row {i}: asset_id '{aid}' belongs to {reg_isin}, regenerated for {row_isin}")
+                else:
+                    result.fail(f"Row {i}: asset_id '{aid}' exists in registry for {reg_isin}, but this row is {row_isin}")
+            # Same company or can't tell → allow (carried-over ALD ID)
 
     if empty_rows and not fix:
         result.fail(f"Empty asset_id at {len(empty_rows)} rows: {empty_rows[:10]}{'...' if len(empty_rows) > 10 else ''}")
@@ -451,12 +795,16 @@ def check_coordinates(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
-def check_entity_stake(rows: list[dict], **_kw) -> CheckResult:
-    """entity_stake_pct is 0-100 when present."""
+def check_entity_stake(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """entity_stake_pct is 0-100 when present. Fix fills empty with 100.0."""
     result = CheckResult("entity_stake_pct")
+    empty_count = 0
     for i, row in enumerate(rows):
         val = row.get("entity_stake_pct", "").strip()
         if not val:
+            if fix:
+                rows[i]["entity_stake_pct"] = "100.0"
+                empty_count += 1
             continue
         try:
             pct = float(val)
@@ -465,6 +813,8 @@ def check_entity_stake(rows: list[dict], **_kw) -> CheckResult:
             continue
         if not (0 <= pct <= 100):
             result.fail(f"Row {i}: entity_stake_pct {pct} out of range [0, 100]")
+    if empty_count:
+        result.fix(f"Filled {empty_count} empty entity_stake_pct with 100.0")
     return result
 
 
@@ -603,9 +953,52 @@ def check_entity_name_casing(rows: list[dict], fix: bool = False, **_kw) -> Chec
     return result
 
 
-def check_supplementary_details(rows: list[dict], **_kw) -> CheckResult:
-    """supplementary_details is valid JSON dict when present."""
+def check_address_exists(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """Flag rows with coords but no address. Fix by reverse geocoding."""
+    result = CheckResult("address_exists")
+    missing = []
+    for i, row in enumerate(rows):
+        lat = row.get("latitude", "").strip() if isinstance(row.get("latitude"), str) else str(row.get("latitude", ""))
+        addr = row.get("address", "").strip()
+        if lat and lat not in ("", "None") and (not addr or addr == "None"):
+            missing.append(i)
+
+    if not missing:
+        return result
+
+    if fix and missing:
+        import urllib.request
+        import time
+        fixed = 0
+        for i in missing[:50]:  # Cap at 50 to respect rate limits
+            lat = row.get("latitude") if (row := rows[i]) else None
+            lon = row.get("longitude")
+            try:
+                url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+                req = urllib.request.Request(url, headers={"User-Agent": "ald-checker/1.0"})
+                resp = urllib.request.urlopen(req, timeout=10)
+                data = json.loads(resp.read())
+                addr = data.get("display_name", "")
+                if addr:
+                    rows[i]["address"] = addr
+                    fixed += 1
+                time.sleep(1.1)
+            except Exception:
+                pass
+        if fixed:
+            result.fix(f"Reverse geocoded {fixed} addresses (of {len(missing)} missing)")
+        remaining = len(missing) - fixed
+        if remaining:
+            result.fail(f"{remaining} rows still missing address")
+    else:
+        result.fail(f"{len(missing)} rows have coords but no address")
+    return result
+
+
+def check_supplementary_details(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """supplementary_details is valid JSON dict when present. Fix converts key:val format."""
     result = CheckResult("supplementary_details_json")
+    fixed_count = 0
     for i, row in enumerate(rows):
         val = row.get("supplementary_details", "").strip()
         if not val:
@@ -615,13 +1008,100 @@ def check_supplementary_details(rows: list[dict], **_kw) -> CheckResult:
             if not isinstance(parsed, dict):
                 result.fail(f"Row {i}: supplementary_details is {type(parsed).__name__}, expected dict")
         except json.JSONDecodeError:
-            result.fail(f"Row {i}: supplementary_details is not valid JSON: {val[:80]}...")
+            if fix:
+                # Try to parse "key: val; key: val" format
+                pairs = {}
+                for part in val.split(";"):
+                    part = part.strip()
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        pairs[k.strip()] = v.strip()
+                    elif part:
+                        pairs["info"] = part
+                if pairs:
+                    rows[i]["supplementary_details"] = json.dumps(pairs)
+                    fixed_count += 1
+                else:
+                    result.fail(f"Row {i}: could not parse supplementary_details: {val[:80]}")
+            else:
+                result.fail(f"Row {i}: supplementary_details is not valid JSON: {val[:80]}...")
+    if fixed_count:
+        result.fix(f"Converted {fixed_count} key:val strings to JSON")
+    return result
+
+
+def check_entity_parent_consistency(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+    """Same entity_name always maps to same parent_name and parent_isin."""
+    result = CheckResult("entity_parent_consistency")
+    from collections import Counter
+    entity_parents: dict[str, Counter] = {}
+    for row in rows:
+        en = row.get("entity_name", "").strip()
+        pn = row.get("parent_name", "").strip()
+        pi = row.get("parent_isin", "").strip()
+        if en:
+            key = f"{pn}||{pi}"
+            entity_parents.setdefault(en, Counter())[key] += 1
+
+    for entity, parents in entity_parents.items():
+        if len(parents) <= 1:
+            continue
+        winner_key, _ = parents.most_common(1)[0]
+        winner_pn, winner_pi = winner_key.split("||")
+        minority = {k: v for k, v in parents.items() if k != winner_key}
+
+        if fix:
+            fixed = 0
+            for row in rows:
+                if row.get("entity_name", "").strip() == entity:
+                    current = f"{row.get('parent_name', '').strip()}||{row.get('parent_isin', '').strip()}"
+                    if current != winner_key:
+                        row["parent_name"] = winner_pn
+                        row["parent_isin"] = winner_pi
+                        fixed += 1
+            if fixed:
+                result.fix(f"'{entity}': standardized parent to '{winner_pn}' at {fixed} rows")
+        else:
+            result.fail(f"'{entity}' has multiple parents: {dict(parents)}")
+    return result
+
+
+def check_entity_isin_valid(rows: list[dict], **_kw) -> CheckResult:
+    """Validate entity_isin exists in corp-graph if present."""
+    result = CheckResult("entity_isin_valid")
+    isins = set()
+    for row in rows:
+        isin = row.get("entity_isin", "").strip()
+        if isin:
+            isins.add(isin)
+
+    if not isins:
+        return result
+
+    # Check against corp-graph
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        import os
+        db_url = os.environ.get("CORPGRAPH_DB_URL", "postgresql://corpgraph:corpgraph@localhost:5432/corpgraph")
+        conn = psycopg.connect(db_url, row_factory=dict_row)
+        for isin in isins:
+            cur = conn.execute(
+                "SELECT COUNT(*) as cnt FROM company_universe WHERE %s = ANY(isin_list)", (isin,)
+            )
+            if cur.fetchone()["cnt"] == 0:
+                result.fail(f"ISIN '{isin}' not found in corp-graph")
+        conn.close()
+    except Exception:
+        pass  # Skip if corp-graph not available
     return result
 
 
 def check_duplicate_assets(rows: list[dict], **_kw) -> CheckResult:
-    """No duplicate asset names for the same entity."""
+    """Flag assets that share same name + same entity + identical/near-identical coords + similar address."""
     result = CheckResult("duplicate_assets")
+
+    # Group by name + entity
     key_rows: dict[str, list[int]] = {}
     for i, row in enumerate(rows):
         name = row.get("name", "").strip().lower()
@@ -631,9 +1111,29 @@ def check_duplicate_assets(rows: list[dict], **_kw) -> CheckResult:
             key_rows.setdefault(key, []).append(i)
 
     for key, idxs in key_rows.items():
-        if len(idxs) > 1:
-            entity, name = key.split("||")
-            result.fail(f"Duplicate asset name '{name}' for '{entity}' at rows {idxs}")
+        if len(idxs) <= 1:
+            continue
+
+        # Same name + entity — now check if coords are near-identical
+        for a_idx in range(len(idxs)):
+            for b_idx in range(a_idx + 1, len(idxs)):
+                row_a = rows[idxs[a_idx]]
+                row_b = rows[idxs[b_idx]]
+                try:
+                    lat_a, lon_a = float(row_a["latitude"]), float(row_a["longitude"])
+                    lat_b, lon_b = float(row_b["latitude"]), float(row_b["longitude"])
+                    dist = math.sqrt((lat_a - lat_b) ** 2 + (lon_a - lon_b) ** 2) * 111_000
+                    if dist < 100:  # Within ~100m
+                        entity, name = key.split("||")
+                        result.fail(
+                            f"Duplicate: '{name}' for '{entity}' at rows {idxs[a_idx]} and {idxs[b_idx]} ({dist:.0f}m apart)"
+                        )
+                except (ValueError, TypeError, KeyError):
+                    # If coords missing, fall back to same name = duplicate
+                    entity, name = key.split("||")
+                    result.fail(f"Duplicate asset name '{name}' for '{entity}' at rows {idxs}")
+                    break
+
     return result
 
 
@@ -742,9 +1242,9 @@ def check_entity_name_consistency(rows: list[dict], fix: bool = False, **_kw) ->
 
 
 def check_coordinate_proximity(rows: list[dict], **_kw) -> CheckResult:
-    """Flag asset pairs within 100m of each other (likely missed dedup)."""
+    """Flag asset pairs within 25m of each other (likely missed dedup)."""
     result = CheckResult("coordinate_proximity")
-    THRESHOLD_M = 100
+    THRESHOLD_M = 25
 
     geo_rows: list[tuple[int, float, float, str]] = []
     for i, row in enumerate(rows):
@@ -785,8 +1285,8 @@ def check_coordinate_proximity(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
-def check_attribution_source(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
-    """attribution_source is set on every row."""
+def check_attribution_source(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """attribution_source is set and standardized on every row."""
     result = CheckResult("attribution_source")
     empty = [i for i, r in enumerate(rows) if not r.get("attribution_source", "").strip()]
     if fix and empty:
@@ -795,19 +1295,48 @@ def check_attribution_source(rows: list[dict], fix: bool = False, **_kw) -> Chec
         result.fix(f"Filled empty attribution_source with 'asset_discovery' at {len(empty)} rows")
     elif empty:
         result.fail(f"Empty attribution_source at {len(empty)} rows: {empty[:10]}")
+
+    # LLM standardize messy values (only if they look like sentences/descriptions, not clean identifiers)
+    if fix_llm:
+        nonstandard: dict[str, list[int]] = {}
+        for i, r in enumerate(rows):
+            src = r.get("attribution_source", "").strip()
+            if src and (" " in src or src[0].isupper()):  # Looks like free text, not a clean identifier
+                nonstandard.setdefault(src, []).append(i)
+        if nonstandard:
+            llm = _try_llm_import()
+            if llm:
+                try:
+                    mapped = llm.standardize_attribution(list(nonstandard.keys()), model=model or llm.DEFAULT_MODEL)
+                    for orig, std in mapped.items():
+                        if orig in nonstandard and std != orig:
+                            for idx in nonstandard[orig]:
+                                rows[idx]["attribution_source"] = std
+                            result.fix(f"Attribution: '{orig}' → '{std}' at {len(nonstandard[orig])} rows")
+                except Exception:
+                    pass
     return result
 
 
 # ── Check registry + runner ──────────────────────────────────────────────────
 
 ALL_CHECKS = [
+    # Phase 1: Column structure
     check_columns,
+    check_none_strings,
+    check_numeric_cleanup,
     check_asset_id_unique,
+    # Phase 2: Classification (order matters: raw type → NS → GICS)
+    check_asset_type_raw_standardize,
+    check_naturesense_correct,
+    check_gics_correct,
     check_naturesense_valid,
     check_naturesense_consistency,
     check_gics_valid,
     check_gics_consistency,
+    # Phase 3: Data quality
     check_coordinates,
+    check_address_exists,
     check_entity_stake,
     check_capacity_non_negative,
     check_status_values,
@@ -815,14 +1344,18 @@ ALL_CHECKS = [
     check_name_casing,
     check_entity_name_casing,
     check_supplementary_details,
-    check_duplicate_assets,
     check_date_researched,
     check_isin_format,
     check_capacity_units_consistency,
     check_source_url_format,
-    check_entity_name_consistency,
-    check_coordinate_proximity,
     check_attribution_source,
+    # Phase 4: Entity structure
+    check_entity_name_consistency,
+    check_entity_parent_consistency,
+    check_entity_isin_valid,
+    # Phase 5: Duplicates & proximity
+    check_duplicate_assets,
+    check_coordinate_proximity,
 ]
 
 
@@ -831,6 +1364,10 @@ def run_checks(
     fix: bool = False,
     fix_llm: bool = False,
     model: str = "",
+    only_checks: list[str] | None = None,
+    skip_checks: list[str] | None = None,
+    no_xlsx: bool = False,
+    dry_run: bool = False,
 ) -> list[CheckResult]:
     """Run all checks on a CSV file. Returns list of CheckResults."""
     path = Path(csv_path)
@@ -839,7 +1376,7 @@ def run_checks(
 
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        headers = reader.fieldnames or []
+        headers = list(reader.fieldnames or [])
         rows = list(reader)
 
     print(f"\n{'='*60}")
@@ -847,12 +1384,25 @@ def run_checks(
     print(f"Rows: {len(rows)}")
     if fix_llm:
         print(f"LLM model: {model or 'openai/gpt-4.1-nano'}")
+    if only_checks:
+        print(f"Only: {only_checks}")
+    if skip_checks:
+        print(f"Skip: {skip_checks}")
+    if dry_run:
+        print("DRY RUN — no output files will be written")
     print(f"{'='*60}")
 
+    # Filter checks
+    checks_to_run = ALL_CHECKS
+    if only_checks:
+        checks_to_run = [fn for fn in ALL_CHECKS if fn.__name__.replace("check_", "") in only_checks]
+    if skip_checks:
+        checks_to_run = [fn for fn in checks_to_run if fn.__name__.replace("check_", "") not in skip_checks]
+
     results = []
-    for check_fn in ALL_CHECKS:
+    for check_fn in checks_to_run:
         if check_fn == check_columns:
-            r = check_fn(rows, headers)
+            r = check_fn(rows, headers, fix=fix, fix_llm=fix_llm, model=model)
         else:
             r = check_fn(rows, fix=fix, fix_llm=fix_llm, model=model)
         results.append(r)
@@ -867,13 +1417,96 @@ def run_checks(
             print(f"         \033[33m{fixed_msg}\033[0m")
 
     # Write fixed output
-    if (fix or fix_llm) and any(r.fixed for r in results):
-        out_path = path.with_stem(path.stem + "_checked")
-        with out_path.open("w", newline="", encoding="utf-8") as f:
+    if (fix or fix_llm) and any(r.fixed for r in results) and not dry_run:
+        # Sort rows: entity_name → asset_type_raw → name
+        rows.sort(key=lambda r: (
+            r.get("entity_name", "").lower(),
+            r.get("asset_type_raw", "").lower(),
+            r.get("name", "").lower(),
+        ))
+
+        # Write CSV
+        csv_out = path.with_stem(path.stem + "_checked")
+        with csv_out.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\n  Fixed output written to: {out_path}")
+        print(f"\n  Fixed CSV written to: {csv_out}")
+
+        # Write xlsx with Key + Assets + Review tabs
+        try:
+            if no_xlsx:
+                raise ImportError("xlsx disabled")
+            import openpyxl
+            from collections import Counter
+
+            wb = openpyxl.Workbook()
+
+            # --- Key sheet ---
+            ws_key = wb.active
+            ws_key.title = "Key"
+            entity = rows[0].get("entity_name", "") if rows else ""
+            isin = rows[0].get("entity_isin", "") if rows else ""
+            parent = rows[0].get("parent_name", "") if rows else ""
+
+            r = 1
+            ws_key.cell(r, 1, entity); ws_key.cell(r, 2, "ALD Output"); r += 2
+            ws_key.cell(r, 1, "ISIN"); ws_key.cell(r, 2, isin or "N/A"); r += 1
+            ws_key.cell(r, 1, "Entity"); ws_key.cell(r, 2, entity); r += 1
+            if parent:
+                ws_key.cell(r, 1, "Parent"); ws_key.cell(r, 2, parent); r += 1
+            ws_key.cell(r, 1, "Total Assets"); ws_key.cell(r, 2, len(rows)); r += 2
+
+            ns_counts = Counter(row.get("naturesense_asset_type", "") for row in rows)
+            ws_key.cell(r, 1, "NatureSense Types"); r += 1
+            for ns, cnt in ns_counts.most_common():
+                ws_key.cell(r, 1, f"  {ns}"); ws_key.cell(r, 2, cnt); r += 1
+            r += 1
+
+            gics_counts = Counter(str(row.get("industry_code", "")) for row in rows)
+            ws_key.cell(r, 1, "GICS Codes"); r += 1
+            for gics, cnt in gics_counts.most_common():
+                ws_key.cell(r, 1, f"  {gics}"); ws_key.cell(r, 2, cnt); r += 1
+            r += 1
+
+            type_counts = Counter(row.get("asset_type_raw", "") for row in rows)
+            ws_key.cell(r, 1, "Asset Types"); r += 1
+            for t, cnt in type_counts.most_common():
+                ws_key.cell(r, 1, f"  {t}"); ws_key.cell(r, 2, cnt); r += 1
+            r += 1
+
+            # Audit log
+            ws_key.cell(r, 1, "Audit Log"); r += 1
+            for check_r in results:
+                if check_r.fixed:
+                    for msg in check_r.fixed:
+                        ws_key.cell(r, 1, f"  FIXED: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
+                elif not check_r.passed:
+                    for msg in check_r.issues:
+                        ws_key.cell(r, 1, f"  FAIL: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
+
+            ws_key.column_dimensions["A"].width = 50
+            ws_key.column_dimensions["B"].width = 60
+
+            # --- Assets sheet ---
+            ws_assets = wb.create_sheet("Assets")
+            out_cols = [h for h in ALD_COLUMNS if h in headers]
+            # Add extra cols that exist
+            for h in headers:
+                if h in EXTRA_COLUMNS and h not in out_cols:
+                    out_cols.append(h)
+
+            for j, col in enumerate(out_cols, 1):
+                ws_assets.cell(1, j, col)
+            for i, row in enumerate(rows, 2):
+                for j, col in enumerate(out_cols, 1):
+                    ws_assets.cell(i, j, row.get(col, ""))
+
+            xlsx_out = path.with_suffix(".xlsx")
+            wb.save(str(xlsx_out))
+            print(f"  Fixed XLSX written to: {xlsx_out}")
+        except ImportError:
+            print("  (openpyxl not installed — skipping xlsx output)")
 
     passed = sum(1 for r in results if r.passed and not r.fixed)
     fixed = sum(1 for r in results if r.fixed)

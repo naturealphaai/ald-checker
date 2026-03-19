@@ -26,6 +26,28 @@ def _strip_fences(raw: str) -> str:
     return raw
 
 
+def standardize_raw_types(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
+    """Standardize asset_type_raw values — fix typos, normalize format, merge obvious duplicates."""
+    items = "\n".join(f"- {r}" for r in raw_types)
+    prompt = (
+        "Standardize these asset type names. Fix typos, normalize casing and format, "
+        "merge obvious duplicates of the same concept. Do NOT change meaning — "
+        "keep the specificity (e.g. 'Semiconductor Fab (300mm)' stays specific, "
+        "don't generalize to 'manufacturing facility').\n\n"
+        "Rules:\n"
+        "- Use lowercase\n"
+        "- Fix obvious typos (e.g. 'seimconducter' → 'semiconductor')\n"
+        "- Normalize format (e.g. 'R & D Center' → 'r&d center')\n"
+        "- Merge duplicates (e.g. 'HQ' and 'head quarters' → 'corporate headquarters')\n"
+        "- Keep specificity (size, capacity info, etc.)\n"
+        "- If a type is already clean, return it unchanged\n\n"
+        f"Asset types to standardize:\n{items}\n\n"
+        'Respond with JSON only: {{"original": "standardized", ...}}\n'
+        "Only include entries that changed. Omit unchanged ones."
+    )
+    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+
 def classify_naturesense(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
     """Classify asset_type_raw values into NatureSense types via LLM."""
     ns_list = "\n".join(f"- {t}" for t in sorted(VALID_NATURESENSE))
@@ -51,6 +73,60 @@ def classify_gics(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str,
         f"Asset types to classify:\n{items}\n\n"
         'Respond with JSON only: {{"asset_type_raw": "GICS code", ...}}\n'
         "Use the exact 6-digit codes from the list above."
+    )
+    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+
+def map_columns(unknown_cols: list[str], known_cols: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
+    """Map unknown column names to standard ALD columns via LLM."""
+    known = "\n".join(f"- {c}" for c in known_cols)
+    unknown = "\n".join(f"- {c}" for c in unknown_cols)
+    prompt = (
+        "Map these unknown CSV column names to the correct standard ALD column name.\n\n"
+        f"Standard ALD columns:\n{known}\n\n"
+        f"Unknown columns to map:\n{unknown}\n\n"
+        'Respond with JSON: {{"unknown_col": "standard_col_or_DROP", ...}}\n'
+        'Use "DROP" if the column has no ALD equivalent and should be removed.'
+    )
+    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+
+def standardize_attribution(sources: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
+    """Standardize attribution source values via LLM."""
+    items = "\n".join(f"- {s}" for s in sources)
+    prompt = (
+        "Standardize these attribution source values into canonical forms.\n\n"
+        "Standard values: asset_discovery, overture_maps, places_discovery_atp, "
+        "store_locator_scrape, serpapi_google_maps, manual_research, web_scrape, "
+        "ald_basefile, perplexity, craft, gem, gleif\n\n"
+        f"Sources to standardize:\n{items}\n\n"
+        'Respond with JSON: {{"original": "standardized", ...}}\n'
+        "Only include entries that changed."
+    )
+    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+
+def parse_dates(dates: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
+    """Parse non-standard date strings to YYYY-MM-DD format via LLM."""
+    items = "\n".join(f"- {d}" for d in dates)
+    prompt = (
+        "Convert each date to YYYY-MM-DD format.\n\n"
+        f"Dates to convert:\n{items}\n\n"
+        'Respond with JSON: {{"original": "YYYY-MM-DD", ...}}\n'
+        "Only include entries that changed. If a date is already YYYY-MM-DD, omit it."
+    )
+    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+
+def standardize_capacity_units(units_with_types: dict[str, list[str]], model: str = DEFAULT_MODEL) -> dict[str, str]:
+    """Normalize capacity units. Input: {asset_type: [unit1, unit2, ...]}. Returns {original_unit: standardized_unit}."""
+    items = "\n".join(f"- {t}: {', '.join(units)}" for t, units in units_with_types.items())
+    prompt = (
+        "For each asset type, the capacity units are inconsistent. "
+        "Pick the most standard unit and map all variants to it.\n\n"
+        f"Asset types and their units:\n{items}\n\n"
+        'Respond with JSON: {{"original_unit": "standardized_unit", ...}}\n'
+        "Only include entries that changed."
     )
     return json.loads(_strip_fences(_llm_classify(prompt, model)))
 
