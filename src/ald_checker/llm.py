@@ -41,7 +41,8 @@ def standardize_raw_types(raw_types: list[str], model: str = DEFAULT_MODEL) -> d
         "- Normalize format (e.g. 'R & D Center' → 'r&d center')\n"
         "- Merge duplicates (e.g. 'HQ' and 'head quarters' → 'corporate headquarters')\n"
         "- Keep specificity (size, capacity info, etc.)\n"
-        "- If a type is already clean, return it unchanged\n\n"
+        "- If a type is already clean, return it unchanged\n"
+        "- Preserve spacing around & (e.g. 'museum & visitor center' stays as is)\n\n"
         f"Asset types to standardize:\n{items}\n\n"
         'Respond with JSON only: {{"original": "standardized", ...}}\n'
         "Only include entries that changed. Omit unchanged ones."
