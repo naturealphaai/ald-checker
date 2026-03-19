@@ -33,9 +33,9 @@ def _load_config() -> dict:
             return {}
 
     search_paths = [
-        Path.cwd() / "config.toml",
-        Path(__file__).resolve().parent.parent.parent / "config.toml",  # repo root
+        Path(__file__).resolve().parent.parent.parent / "config.toml",  # ald-checker repo root (priority)
         Path.home() / ".config" / "ald-checker" / "config.toml",
+        Path.cwd() / "ald-checker.toml",  # only if explicitly named
     ]
     for p in search_paths:
         if p.exists():
@@ -314,19 +314,28 @@ def check_naturesense_correct(rows: list[dict], fix: bool = False, fix_llm: bool
     wrong: dict[str, list[int]] = {}  # (raw, current_ns, expected_ns) -> idxs
     unknown_raw: dict[str, list[int]] = {}
 
+    missing_ns: dict[str, list[int]] = {}
+
     for i, row in enumerate(rows):
         raw = row.get("asset_type_raw", "").strip().lower()
-        ns = row.get("naturesense_asset_type", "").strip()
-        if not raw or not ns:
+        if not raw:
             continue
+        ns = row.get("naturesense_asset_type", "").strip()
+        is_empty = not ns or ns == "None"
 
         if raw in mappings:
             expected_ns = mappings[raw]["ns"]
-            if ns != expected_ns:
+            if is_empty:
+                key = (raw, "", expected_ns)
+                wrong.setdefault(key, []).append(i)
+            elif ns != expected_ns:
                 key = (raw, ns, expected_ns)
                 wrong.setdefault(key, []).append(i)
         else:
-            unknown_raw.setdefault(raw, []).append(i)
+            if is_empty:
+                missing_ns.setdefault(raw, []).append(i)
+            else:
+                unknown_raw.setdefault(raw, []).append(i)
 
     if not fix and not fix_llm:
         for (raw, current, expected), idxs in wrong.items():
@@ -338,6 +347,10 @@ def check_naturesense_correct(rows: list[dict], fix: bool = False, fix_llm: bool
         for idx in idxs:
             rows[idx]["naturesense_asset_type"] = expected
         result.fix(f"'{raw}': '{current}' → '{expected}' at {len(idxs)} rows")
+
+    # Merge missing_ns into unknown_raw for LLM
+    for raw, idxs in missing_ns.items():
+        unknown_raw.setdefault(raw, []).extend(idxs)
 
     # For unknown raw types, use LLM to determine correct NS and save to corp-graph
     if unknown_raw and fix_llm:
@@ -351,9 +364,8 @@ def check_naturesense_correct(rows: list[dict], fix: bool = False, fix_llm: bool
                         for idx in unknown_raw[raw]:
                             rows[idx]["naturesense_asset_type"] = ns_result
                         result.fix(f"LLM: '{raw}' → NS='{ns_result}' at {len(unknown_raw[raw])} rows")
-                        gics = rows[unknown_raw[raw][0]].get("industry_code", "")
-                        if gics:
-                            _save_type_mapping(raw, ns_result, gics, "llm")
+                        # Don't save to mapping table here — GICS hasn't been classified yet
+                        # check_gics_correct will save the full mapping after GICS is determined
             except Exception:
                 pass
 
@@ -368,19 +380,29 @@ def check_gics_correct(rows: list[dict], fix: bool = False, fix_llm: bool = Fals
     wrong: dict[str, list[int]] = {}
     unknown_raw: dict[str, list[int]] = {}
 
+    missing_gics: dict[str, list[int]] = {}
+
     for i, row in enumerate(rows):
         raw = row.get("asset_type_raw", "").strip().lower()
-        gics = str(row.get("industry_code", "")).strip()
-        if not raw or not gics or gics == "None":
+        if not raw:
             continue
+        gics = str(row.get("industry_code", "")).strip()
+        is_empty = not gics or gics == "None" or gics == ""
 
         if raw in mappings:
             expected_gics = mappings[raw]["gics"]
-            if gics != expected_gics:
+            if is_empty:
+                # Empty GICS but we know what it should be
+                key = (raw, "", expected_gics)
+                wrong.setdefault(key, []).append(i)
+            elif gics != expected_gics:
                 key = (raw, gics, expected_gics)
                 wrong.setdefault(key, []).append(i)
         else:
-            unknown_raw.setdefault(raw, []).append(i)
+            if is_empty:
+                missing_gics.setdefault(raw, []).append(i)
+            else:
+                unknown_raw.setdefault(raw, []).append(i)
 
     if not fix and not fix_llm:
         for (raw, current, expected), idxs in wrong.items():
@@ -392,6 +414,10 @@ def check_gics_correct(rows: list[dict], fix: bool = False, fix_llm: bool = Fals
         for idx in idxs:
             rows[idx]["industry_code"] = expected
         result.fix(f"'{raw}': GICS '{current}' → '{expected}' at {len(idxs)} rows")
+
+    # Merge missing_gics into unknown_raw for LLM classification
+    for raw, idxs in missing_gics.items():
+        unknown_raw.setdefault(raw, []).extend(idxs)
 
     # LLM for unknown
     if unknown_raw and fix_llm:
@@ -1000,29 +1026,44 @@ def check_address_exists(rows: list[dict], fix: bool = False, **_kw) -> CheckRes
         return result
 
     if fix and missing:
-        import urllib.request
-        import time
         fixed = 0
-        for i in missing[:50]:  # Cap at 50 to respect rate limits
-            lat = row.get("latitude") if (row := rows[i]) else None
-            lon = row.get("longitude")
-            try:
-                url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
-                req = urllib.request.Request(url, headers={"User-Agent": "ald-checker/1.0"})
-                resp = urllib.request.urlopen(req, timeout=10)
-                data = json.loads(resp.read())
-                addr = data.get("display_name", "")
-                if addr:
-                    rows[i]["address"] = addr
-                    fixed += 1
-                time.sleep(1.1)
-            except Exception:
-                pass
+        # Try geo-resolve first (uses Google API key from .env)
+        try:
+            from geo_resolve import reverse_geocode
+            for i in missing:
+                row = rows[i]
+                lat, lon = row.get("latitude"), row.get("longitude")
+                try:
+                    addr = reverse_geocode(float(lat), float(lon))
+                    if addr:
+                        rows[i]["address"] = addr
+                        fixed += 1
+                except Exception:
+                    pass
+        except ImportError:
+            # Fallback to Nominatim if geo-resolve not installed
+            import urllib.request
+            import time
+            for i in missing[:50]:
+                row = rows[i]
+                lat, lon = row.get("latitude"), row.get("longitude")
+                try:
+                    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+                    req = urllib.request.Request(url, headers={"User-Agent": "ald-checker/1.0"})
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    data = json.loads(resp.read())
+                    addr = data.get("display_name", "")
+                    if addr:
+                        rows[i]["address"] = addr
+                        fixed += 1
+                    time.sleep(1.1)
+                except Exception:
+                    pass
         if fixed:
             result.fix(f"Reverse geocoded {fixed} addresses (of {len(missing)} missing)")
         remaining = len(missing) - fixed
         if remaining:
-            result.fail(f"{remaining} rows still missing address")
+            result.warn(f"{remaining} rows still missing address")
     else:
         result.fail(f"{len(missing)} rows have coords but no address")
     return result
@@ -1559,9 +1600,36 @@ def run_checks(
             # --- Key sheet ---
             ws_key = wb.active
             ws_key.title = "Key"
-            entity = rows[0].get("entity_name", "") if rows else ""
-            isin = rows[0].get("entity_isin", "") if rows else ""
-            parent = rows[0].get("parent_name", "") if rows else ""
+            # Find the top-level entity: most common parent_name, or most common entity_name if no parents
+            from collections import Counter as _Counter
+            parent_counts = _Counter(r.get("parent_name", "").strip() for r in rows if r.get("parent_name", "").strip())
+            entity_counts = _Counter(r.get("entity_name", "").strip() for r in rows)
+            if parent_counts:
+                # Has parent/child structure — top entity is the most common parent
+                top_entity = parent_counts.most_common(1)[0][0]
+                # Find its ISIN from any row where it's entity_name
+                top_isin = ""
+                for r in rows:
+                    if r.get("entity_name", "").strip() == top_entity and r.get("entity_isin", "").strip():
+                        top_isin = r["entity_isin"].strip()
+                        break
+                # If not found as entity, check parent_isin
+                if not top_isin:
+                    for r in rows:
+                        if r.get("parent_name", "").strip() == top_entity and r.get("parent_isin", "").strip():
+                            top_isin = r["parent_isin"].strip()
+                            break
+                entity = top_entity
+                isin = top_isin
+                parent = ""
+            else:
+                entity = entity_counts.most_common(1)[0][0] if entity_counts else ""
+                isin = ""
+                for r in rows:
+                    if r.get("entity_name", "").strip() == entity and r.get("entity_isin", "").strip():
+                        isin = r["entity_isin"].strip()
+                        break
+                parent = ""
 
             r = 1
             ws_key.cell(r, 1, entity); ws_key.cell(r, 2, "ALD Output"); r += 2
@@ -1589,18 +1657,23 @@ def run_checks(
                 ws_key.cell(r, 1, f"  {t}"); ws_key.cell(r, 2, cnt); r += 1
             r += 1
 
-            # Audit log
-            ws_key.cell(r, 1, "Audit Log"); r += 1
-            for check_r in results:
-                for msg in check_r.fixed:
-                    ws_key.cell(r, 1, f"  FIXED: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
-                for msg in check_r.issues:
-                    ws_key.cell(r, 1, f"  FAIL: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
-                for msg in check_r.warnings:
-                    ws_key.cell(r, 1, f"  WARN: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
-
             ws_key.column_dimensions["A"].width = 50
             ws_key.column_dimensions["B"].width = 60
+
+            # --- Audit sheet ---
+            ws_audit = wb.create_sheet("Audit")
+            ws_audit.cell(1, 1, "Check"); ws_audit.cell(1, 2, "Status"); ws_audit.cell(1, 3, "Detail")
+            ar = 2
+            for check_r in results:
+                for msg in check_r.fixed:
+                    ws_audit.cell(ar, 1, check_r.name); ws_audit.cell(ar, 2, "FIXED"); ws_audit.cell(ar, 3, msg); ar += 1
+                for msg in check_r.issues:
+                    ws_audit.cell(ar, 1, check_r.name); ws_audit.cell(ar, 2, "FAIL"); ws_audit.cell(ar, 3, msg); ar += 1
+                for msg in check_r.warnings:
+                    ws_audit.cell(ar, 1, check_r.name); ws_audit.cell(ar, 2, "WARN"); ws_audit.cell(ar, 3, msg); ar += 1
+            ws_audit.column_dimensions["A"].width = 35
+            ws_audit.column_dimensions["B"].width = 10
+            ws_audit.column_dimensions["C"].width = 80
 
             # --- Assets sheet ---
             ws_assets = wb.create_sheet("Assets")

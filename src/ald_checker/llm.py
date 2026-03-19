@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import re
 
-from ald_checker.reference import VALID_NATURESENSE, _load_gics_reference
+from ald_checker.reference import VALID_NATURESENSE, _load_gics_reference, _load_naturesense_reference
 
 DEFAULT_MODEL = "openai/gpt-4.1-nano"
 
 
 def _llm_classify(prompt: str, model: str = DEFAULT_MODEL) -> str:
     import litellm
+    litellm.drop_params = True
     resp = litellm.completion(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -50,31 +51,61 @@ def standardize_raw_types(raw_types: list[str], model: str = DEFAULT_MODEL) -> d
 
 def classify_naturesense(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
     """Classify asset_type_raw values into NatureSense types via LLM."""
-    ns_list = "\n".join(f"- {t}" for t in sorted(VALID_NATURESENSE))
+    ns_ref = _load_naturesense_reference()
     items = "\n".join(f"- {r}" for r in raw_types)
     prompt = (
-        "Classify each asset type into exactly one NatureSense category.\n\n"
-        f"Valid NatureSense categories:\n{ns_list}\n\n"
+        "Classify each asset type into exactly one NatureSense category based on what the physical asset IS.\n\n"
+        "Examples of correct classifications:\n"
+        "- semiconductor fab → Heavy Industrial & Manufacturing\n"
+        "- quarry → Mining Operations\n"
+        "- office / headquarters / design center → Office/Housing\n"
+        "- employee housing / dormitory → Office/Housing\n"
+        "- warehouse / distribution center → Warehouse\n"
+        "- retail store → Retail\n"
+        "- wind farm / solar farm / power plant → Energy Production\n"
+        "- childcare facility / recreation facility / park → Other (5km buffer area of influence)\n"
+        "- museum / visitor center → Other (5km buffer area of influence)\n"
+        "- r&d center / lab → R&D Facility\n\n"
+        f"Valid NatureSense categories (with descriptions):\n{ns_ref}\n\n"
         f"Asset types to classify:\n{items}\n\n"
         'Respond with JSON only: {{"asset_type_raw": "NatureSense category", ...}}\n'
-        "Use the exact NatureSense category names from the list above."
+        "Use the EXACT NatureSense category names from the list above. Never invent categories."
     )
     return json.loads(_strip_fences(_llm_classify(prompt, model)))
 
 
 def classify_gics(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
-    """Classify asset_type_raw values into GICS codes via LLM."""
+    """Classify asset_type_raw values into GICS codes via LLM. Batched for efficiency."""
     gics_ref = _load_gics_reference()
-    items = "\n".join(f"- {r}" for r in raw_types)
-    prompt = (
-        "Classify each asset type into a 6-digit GICS industry code based on what "
-        "the asset IS (not the company that owns it).\n\n"
-        f"Valid GICS codes:\n{gics_ref}\n\n"
-        f"Asset types to classify:\n{items}\n\n"
-        'Respond with JSON only: {{"asset_type_raw": "GICS code", ...}}\n'
-        "Use the exact 6-digit codes from the list above."
-    )
-    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+
+    # Batch in chunks of 25 to keep prompt focused
+    results = {}
+    for i in range(0, len(raw_types), 25):
+        batch = raw_types[i:i+25]
+        items = "\n".join(f"- {r}" for r in batch)
+        prompt = (
+            "Classify each asset type into a 6-digit GICS industry code based on what the asset IS.\n\n"
+            "IMPORTANT: ONLY use codes from the valid list below. Do NOT invent codes.\n\n"
+            "Key examples:\n"
+            "- Any semiconductor facility (fab, foundry, packaging, cleanroom) → 453010\n"
+            "- Office, headquarters, housing, dormitory, design center, r&d center → 602010\n"
+            "- Quarry, mine → 151040\n"
+            "- Retail store → 255040\n"
+            "- Distribution center, warehouse → 203050\n"
+            "- Wind farm, solar farm, power plant → 101020\n"
+            "- Childcare, recreation, museum, park → 253020\n\n"
+            f"Valid GICS codes (ONLY use these):\n{gics_ref}\n\n"
+            f"Asset types to classify:\n{items}\n\n"
+            'Respond with JSON only: {{"asset_type": "6-digit GICS code", ...}}\n'
+            "ONLY use exact 6-digit codes from the valid list."
+        )
+        try:
+            batch_results = json.loads(_strip_fences(_llm_classify(prompt, model)))
+            results.update(batch_results)
+        except Exception:
+            pass
+
+    return results
 
 
 def map_columns(unknown_cols: list[str], known_cols: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:

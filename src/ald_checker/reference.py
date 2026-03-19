@@ -43,12 +43,29 @@ def _load_naturesense_types() -> set[str]:
         }
 
 
+def _load_naturesense_reference() -> str:
+    """NatureSense types with descriptions — used as LLM prompt context."""
+    path = _DATA_DIR / "naturesense_asset_types.csv"
+    lines = []
+    with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            name = row.get("asset_type", "").strip()
+            desc = row.get("description", "").strip()
+            if name:
+                entry = f"- {name}"
+                if desc:
+                    entry += f": {desc}"
+                lines.append(entry)
+    return "\n".join(lines)
+
+
 def _load_gics_codes() -> set[str]:
     path = _DATA_DIR / "gics_industries.csv"
     with path.open(newline="", encoding="utf-8") as f:
         codes = set()
         for row in csv.DictReader(f):
-            code = (row.get("industry_code") or row.get(" industry_code") or "").strip()
+            clean = {k.strip(): (v.strip() if v else "") for k, v in row.items() if k}
+            code = clean.get("industry_code", "")
             if code:
                 codes.add(code)
         return codes
@@ -59,11 +76,13 @@ def _load_gics_reference() -> str:
     path = _DATA_DIR / "gics_industries.csv"
     lines = []
     with path.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            code = (row.get("industry_code") or row.get(" industry_code") or "").strip()
-            name = (row.get("industry_name") or row.get(" industry_name") or "").strip()
-            if code and name:
-                lines.append(f"{code}: {name}")
+        for row in csv.reader(f):
+            # CSV has space-padded columns: sector_code, sector_name, group_code, group_name, industry_code, industry_name, description
+            if len(row) >= 6:
+                code = row[4].strip()
+                name = row[5].strip().strip('"')
+                if code and code.isdigit() and len(code) == 6:
+                    lines.append(f"{code}: {name}")
     return "\n".join(lines)
 
 
