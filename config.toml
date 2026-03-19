@@ -1,0 +1,30 @@
+# ald-checker configuration
+
+[llm]
+# Default model (litellm format: provider/model)
+model = "openai/gpt-4.1-nano"
+
+[thresholds]
+# Majority-vote confidence threshold (0.0–1.0) for consistency checks
+majority = 0.7
+
+# Coordinate proximity threshold in metres for dedup warnings
+proximity_m = 100
+
+[database]
+# Corp-graph database URL (env var CORPGRAPH_DB_URL takes precedence)
+# url = "postgresql://corpgraph:corpgraph@localhost:5432/corpgraph"
+
+[output]
+# Suffix appended to input filename stem
+suffix = "_checked"
+
+# Generate XLSX output (requires openpyxl)
+xlsx = true
+
+[checks]
+# Checks to always skip (names without "check_" prefix)
+# skip = ["coordinate_proximity"]
+
+# Default attribution source when missing
+# default_attribution = ""

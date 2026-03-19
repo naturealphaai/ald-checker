@@ -1425,10 +1425,19 @@ def run_checks(
             r.get("name", "").lower(),
         ))
 
-        # Write CSV
+        # Write CSV — use headers which may have been updated by check_columns
+        # Also include any extra columns that were added during fixes
+        all_keys = set()
+        for row in rows:
+            all_keys.update(row.keys())
+        out_headers = [h for h in headers if h in all_keys]
+        for k in all_keys:
+            if k not in out_headers and k:
+                out_headers.append(k)
+
         csv_out = path.with_stem(path.stem + "_checked")
         with csv_out.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
+            writer = csv.DictWriter(f, fieldnames=out_headers, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         print(f"\n  Fixed CSV written to: {csv_out}")
