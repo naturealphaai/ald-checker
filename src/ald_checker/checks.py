@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import uuid
 from datetime import date
@@ -19,6 +20,33 @@ from ald_checker.reference import (
 )
 
 
+# ── Config loading ────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    """Load config from config.toml (package dir, cwd, or ~/.config/ald-checker/)."""
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            return {}
+
+    search_paths = [
+        Path.cwd() / "config.toml",
+        Path(__file__).resolve().parent.parent.parent / "config.toml",  # repo root
+        Path.home() / ".config" / "ald-checker" / "config.toml",
+    ]
+    for p in search_paths:
+        if p.exists():
+            with p.open("rb") as f:
+                return tomllib.load(f)
+    return {}
+
+
+CONFIG = _load_config()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 class CheckResult:
@@ -27,10 +55,15 @@ class CheckResult:
         self.passed = True
         self.issues: list[str] = []
         self.fixed: list[str] = []
+        self.warnings: list[str] = []
 
     def fail(self, msg: str):
         self.passed = False
         self.issues.append(msg)
+
+    def warn(self, msg: str):
+        """Informational warning — doesn't cause failure."""
+        self.warnings.append(msg)
 
     def fix(self, msg: str):
         self.fixed.append(msg)
@@ -1137,18 +1170,18 @@ def check_duplicate_assets(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
-def check_date_researched(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
+def check_date_researched(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
     """date_researched is a valid YYYY-MM-DD date."""
     result = CheckResult("date_researched")
     date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
     today = date.today().isoformat()
 
     empty = [i for i, r in enumerate(rows) if not r.get("date_researched", "").strip()]
-    invalid = [
-        (i, r.get("date_researched", ""))
-        for i, r in enumerate(rows)
-        if r.get("date_researched", "").strip() and not date_re.match(r["date_researched"].strip())
-    ]
+    invalid: dict[str, list[int]] = {}
+    for i, r in enumerate(rows):
+        val = r.get("date_researched", "").strip()
+        if val and not date_re.match(val):
+            invalid.setdefault(val, []).append(i)
 
     if fix and empty:
         for i in empty:
@@ -1157,8 +1190,45 @@ def check_date_researched(rows: list[dict], fix: bool = False, **_kw) -> CheckRe
     elif empty:
         result.fail(f"Empty date_researched at {len(empty)} rows: {empty[:10]}")
 
-    for i, val in invalid:
-        result.fail(f"Row {i}: invalid date format '{val}' (expected YYYY-MM-DD)")
+    if invalid:
+        # Try common deterministic formats first
+        from datetime import datetime
+        FORMATS = ["%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%B %d, %Y", "%b %d, %Y",
+                    "%d %B %Y", "%d %b %Y", "%m-%d-%Y", "%Y%m%d"]
+        still_invalid: dict[str, list[int]] = {}
+        for val, idxs in invalid.items():
+            parsed = None
+            for fmt in FORMATS:
+                try:
+                    parsed = datetime.strptime(val.strip(), fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            if parsed:
+                if fix:
+                    for i in idxs:
+                        rows[i]["date_researched"] = parsed
+                    result.fix(f"Date: '{val}' → '{parsed}' at {len(idxs)} rows")
+            else:
+                still_invalid[val] = idxs
+
+        # LLM fallback for weird formats
+        if still_invalid and fix_llm:
+            llm = _try_llm_import()
+            if llm:
+                try:
+                    parsed_map = llm.parse_dates(list(still_invalid.keys()), model=model or llm.DEFAULT_MODEL)
+                    for orig, parsed in parsed_map.items():
+                        if orig in still_invalid and date_re.match(parsed):
+                            for i in still_invalid[orig]:
+                                rows[i]["date_researched"] = parsed
+                            result.fix(f"LLM date: '{orig}' → '{parsed}' at {len(still_invalid[orig])} rows")
+                except Exception:
+                    pass
+
+        for val, idxs in still_invalid.items():
+            if not any(val in msg for msg in result.fixed):
+                result.fail(f"Invalid date format '{val}' at {len(idxs)} rows")
     return result
 
 
@@ -1174,8 +1244,8 @@ def check_isin_format(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
-def check_capacity_units_consistency(rows: list[dict], **_kw) -> CheckResult:
-    """Same asset_type_raw has consistent capacity_units."""
+def check_capacity_units_consistency(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Same asset_type_raw has consistent capacity_units. Warns on mixed units, LLM can normalize."""
     result = CheckResult("capacity_units_consistency")
     mapping: dict[str, dict[str, list[int]]] = {}
     for i, row in enumerate(rows):
@@ -1185,10 +1255,28 @@ def check_capacity_units_consistency(rows: list[dict], **_kw) -> CheckResult:
         if raw and units and cap:
             mapping.setdefault(raw, {}).setdefault(units, []).append(i)
 
+    mixed = {}
     for raw, units_map in mapping.items():
         if len(units_map) > 1:
             counts = {u: len(idxs) for u, idxs in units_map.items()}
-            result.fail(f"'{raw}' has mixed capacity_units: {counts}")
+            result.warn(f"'{raw}' has mixed capacity_units: {counts}")
+            mixed[raw] = list(units_map.keys())
+
+    # LLM normalize if requested
+    if mixed and fix_llm:
+        llm = _try_llm_import()
+        if llm:
+            try:
+                normalized = llm.standardize_capacity_units(mixed, model=model or llm.DEFAULT_MODEL)
+                for orig, std in normalized.items():
+                    if orig != std:
+                        for raw, units_map in mapping.items():
+                            if orig in units_map:
+                                for idx in units_map[orig]:
+                                    rows[idx]["capacity_units"] = std
+                                result.fix(f"Capacity units: '{orig}' → '{std}'")
+            except Exception:
+                pass
     return result
 
 
@@ -1242,9 +1330,9 @@ def check_entity_name_consistency(rows: list[dict], fix: bool = False, **_kw) ->
 
 
 def check_coordinate_proximity(rows: list[dict], **_kw) -> CheckResult:
-    """Flag asset pairs within 25m of each other (likely missed dedup)."""
+    """Flag asset pairs within proximity threshold of each other."""
     result = CheckResult("coordinate_proximity")
-    THRESHOLD_M = 25
+    THRESHOLD_M = CONFIG.get("thresholds", {}).get("proximity_m", 25)
 
     geo_rows: list[tuple[int, float, float, str]] = []
     for i, row in enumerate(rows):
@@ -1278,7 +1366,7 @@ def check_coordinate_proximity(rows: list[dict], **_kw) -> CheckResult:
                 continue
             dist = _dist_m(lat_a, lon_a, lat_b, lon_b)
             if dist < THRESHOLD_M:
-                result.fail(
+                result.warn(
                     f"Rows {idx_a} & {idx_b} are {dist:.0f}m apart: "
                     f"'{name_a}' vs '{name_b}'"
                 )
@@ -1379,11 +1467,20 @@ def run_checks(
         headers = list(reader.fieldnames or [])
         rows = list(reader)
 
+    # Apply config defaults
+    if not model:
+        model = CONFIG.get("llm", {}).get("model", "openai/gpt-4.1-nano")
+
+    # Merge config skip checks with CLI skip
+    config_skip = CONFIG.get("checks", {}).get("skip", [])
+    if config_skip:
+        skip_checks = list(set((skip_checks or []) + config_skip))
+
     print(f"\n{'='*60}")
     print(f"Checking: {path}")
     print(f"Rows: {len(rows)}")
     if fix_llm:
-        print(f"LLM model: {model or 'openai/gpt-4.1-nano'}")
+        print(f"LLM model: {model}")
     if only_checks:
         print(f"Only: {only_checks}")
     if skip_checks:
@@ -1407,14 +1504,21 @@ def run_checks(
             r = check_fn(rows, fix=fix, fix_llm=fix_llm, model=model)
         results.append(r)
 
-        status = "\033[32mPASS\033[0m" if r.passed else "\033[31mFAIL\033[0m"
         if r.fixed:
             status = "\033[33mFIXED\033[0m"
+        elif r.warnings and r.passed:
+            status = "\033[33mWARN\033[0m"
+        elif r.passed:
+            status = "\033[32mPASS\033[0m"
+        else:
+            status = "\033[31mFAIL\033[0m"
         print(f"  [{status}] {r.name}")
         for issue in r.issues:
             print(f"         {issue}")
         for fixed_msg in r.fixed:
             print(f"         \033[33m{fixed_msg}\033[0m")
+        for warn_msg in r.warnings:
+            print(f"         \033[33m⚠ {warn_msg}\033[0m")
 
     # Write fixed output
     if (fix or fix_llm) and any(r.fixed for r in results) and not dry_run:
@@ -1435,7 +1539,8 @@ def run_checks(
             if k not in out_headers and k:
                 out_headers.append(k)
 
-        csv_out = path.with_stem(path.stem + "_checked")
+        suffix = CONFIG.get("output", {}).get("suffix", "_checked")
+        csv_out = path.with_stem(path.stem + suffix)
         with csv_out.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=out_headers, extrasaction="ignore")
             writer.writeheader()
@@ -1487,12 +1592,12 @@ def run_checks(
             # Audit log
             ws_key.cell(r, 1, "Audit Log"); r += 1
             for check_r in results:
-                if check_r.fixed:
-                    for msg in check_r.fixed:
-                        ws_key.cell(r, 1, f"  FIXED: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
-                elif not check_r.passed:
-                    for msg in check_r.issues:
-                        ws_key.cell(r, 1, f"  FAIL: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
+                for msg in check_r.fixed:
+                    ws_key.cell(r, 1, f"  FIXED: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
+                for msg in check_r.issues:
+                    ws_key.cell(r, 1, f"  FAIL: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
+                for msg in check_r.warnings:
+                    ws_key.cell(r, 1, f"  WARN: {check_r.name}"); ws_key.cell(r, 2, msg); r += 1
 
             ws_key.column_dimensions["A"].width = 50
             ws_key.column_dimensions["B"].width = 60

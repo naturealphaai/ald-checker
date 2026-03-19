@@ -9,7 +9,7 @@ model = "openai/gpt-4.1-nano"
 majority = 0.7
 
 # Coordinate proximity threshold in metres for dedup warnings
-proximity_m = 100
+proximity_m = 25
 
 [database]
 # Corp-graph database URL (env var CORPGRAPH_DB_URL takes precedence)
