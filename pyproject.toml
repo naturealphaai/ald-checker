@@ -19,7 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 llm = ["litellm>=1.0"]
 xlsx = ["openpyxl>=3.1"]
-all = ["litellm>=1.0", "openpyxl>=3.1"]
+geo = ["reverse_geocoder>=1.5", "global-land-mask>=1.0"]
+all = ["litellm>=1.0", "openpyxl>=3.1", "reverse_geocoder>=1.5", "global-land-mask>=1.0"]
 test = ["pytest>=8.0"]
 db = ["psycopg[binary]>=3.1"]
 

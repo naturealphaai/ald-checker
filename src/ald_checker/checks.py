@@ -13,6 +13,9 @@ from pathlib import Path
 from ald_checker.reference import (
     AREA_UNIT_CONVERSIONS,
     CAPACITY_PLAUSIBILITY,
+    CONTINENT_BBOX,
+    COUNTRY_ALIASES,
+    COUNTRY_BBOX,
     EXTRA_COLUMNS,
     STATUS_ALIASES,
     ALD_COLUMNS,
@@ -874,11 +877,238 @@ def check_coordinates(rows: list[dict], **_kw) -> CheckResult:
         if (-90 <= lon <= 90) and not (-90 <= lat <= 90) and (-180 <= lat <= 180):
             result.fail(f"Row {i} '{name}': lat={lat}, lon={lon} — possibly swapped?")
 
-        # Ocean check
+        # Ocean box check (known deep-ocean regions, no land)
         for min_lat, max_lat, min_lon, max_lon, region in OCEAN_BOXES:
             if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
                 result.fail(f"Row {i} '{name}': ({lat}, {lon}) is in the {region}")
                 break
+
+    # Land/water check using global_land_mask (if installed)
+    try:
+        from global_land_mask import globe
+        water_rows = []
+        for i, row in enumerate(rows):
+            lat_s = row.get("latitude", "").strip()
+            lon_s = row.get("longitude", "").strip()
+            name = row.get("name", "").strip()
+            atype = row.get("asset_type_raw", "").strip().lower()
+            if not lat_s or not lon_s:
+                continue
+            try:
+                lat, lon = float(lat_s), float(lon_s)
+            except ValueError:
+                continue
+            if not globe.is_land(lat, lon):
+                # Skip known offshore asset types
+                offshore_types = {"offshore wind farm", "offshore platform", "oil platform",
+                                  "subsea", "fpso", "offshore", "wind farm"}
+                if any(ot in atype for ot in offshore_types):
+                    continue
+                water_rows.append((i, lat, lon, name))
+        if water_rows:
+            for i, lat, lon, name in water_rows:
+                result.warn(
+                    f"Row {i} '{name}': ({lat}, {lon}) appears to be in water "
+                    f"(may be coastal, island, or offshore — verify)"
+                )
+    except ImportError:
+        pass  # global_land_mask not installed, skip
+
+    return result
+
+
+def _try_reverse_geocoder():
+    """Try to import reverse_geocoder. Returns module or None."""
+    try:
+        import reverse_geocoder as rg
+        return rg
+    except ImportError:
+        return None
+
+
+def _parse_country_from_address(address: str) -> str | None:
+    """Extract country from the last segment of an address string."""
+    if not address:
+        return None
+    parts = [p.strip() for p in address.split(",")]
+    if not parts:
+        return None
+    candidate = parts[-1].lower().strip()
+    candidate = re.sub(r"^\d[\d\s-]*", "", candidate).strip()
+    candidate = re.sub(r"\d[\d\s-]*$", "", candidate).strip()
+    if not candidate:
+        return None
+    if candidate in COUNTRY_ALIASES:
+        return COUNTRY_ALIASES[candidate]
+    if candidate in COUNTRY_BBOX:
+        return candidate
+    for country in COUNTRY_BBOX:
+        if country in candidate:
+            return country
+    return None
+
+
+def check_coords_country_match(rows: list[dict], **_kw) -> CheckResult:
+    """Coordinates are in the correct country based on the address field.
+
+    Uses reverse_geocoder (offline KD-tree, 100K+ cities) if installed,
+    falls back to country bounding boxes. Warn-only.
+    """
+    result = CheckResult("coords_country_match")
+
+    # Collect rows with both address and coords
+    to_check = []
+    for i, row in enumerate(rows):
+        address = row.get("address", "").strip()
+        lat_s = row.get("latitude", "").strip()
+        lon_s = row.get("longitude", "").strip()
+        name = row.get("name", "").strip()
+        if not address or not lat_s or not lon_s:
+            continue
+        try:
+            lat, lon = float(lat_s), float(lon_s)
+        except ValueError:
+            continue
+        addr_country = _parse_country_from_address(address)
+        if addr_country:
+            to_check.append((i, lat, lon, name, address, addr_country))
+
+    if not to_check:
+        return result
+
+    rg = _try_reverse_geocoder()
+    if rg:
+        # Batch reverse geocode all coords at once (fast)
+        coords = [(lat, lon) for _, lat, lon, _, _, _ in to_check]
+        geo_results = rg.search(coords)
+        for (idx, lat, lon, name, address, addr_country), geo in zip(to_check, geo_results):
+            coord_cc = geo["cc"].lower()
+            # Map country name to CC for comparison
+            addr_cc = _country_to_cc(addr_country)
+            if addr_cc and coord_cc != addr_cc:
+                result.warn(
+                    f"Row {idx} '{name}': coords ({lat}, {lon}) → "
+                    f"{geo['name']}, {geo['cc']} but address says {addr_country.title()}"
+                )
+    else:
+        # Fallback: bounding box check
+        for idx, lat, lon, name, address, addr_country in to_check:
+            if addr_country not in COUNTRY_BBOX:
+                continue
+            min_lat, max_lat, min_lon, max_lon = COUNTRY_BBOX[addr_country]
+            if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+                result.warn(
+                    f"Row {idx} '{name}': coords ({lat}, {lon}) outside "
+                    f"{addr_country.title()} (address: '{address[-60:]}')"
+                )
+    return result
+
+
+def _country_to_cc(country: str) -> str | None:
+    """Map country name to ISO 2-letter code."""
+    mapping = {
+        "taiwan": "tw", "japan": "jp", "china": "cn", "south korea": "kr",
+        "korea": "kr", "india": "in", "singapore": "sg", "vietnam": "vn",
+        "indonesia": "id", "thailand": "th", "malaysia": "my", "philippines": "ph",
+        "germany": "de", "netherlands": "nl", "france": "fr",
+        "united kingdom": "gb", "uk": "gb", "ireland": "ie",
+        "italy": "it", "spain": "es", "switzerland": "ch",
+        "sweden": "se", "norway": "no", "denmark": "dk", "finland": "fi",
+        "belgium": "be", "austria": "at", "poland": "pl",
+        "czech republic": "cz", "portugal": "pt",
+        "united states": "us", "us": "us", "usa": "us",
+        "canada": "ca", "mexico": "mx", "brazil": "br",
+        "argentina": "ar", "chile": "cl", "colombia": "co",
+        "australia": "au", "new zealand": "nz",
+        "saudi arabia": "sa", "uae": "ae", "israel": "il",
+        "south africa": "za", "egypt": "eg", "turkey": "tr", "nigeria": "ng",
+    }
+    return mapping.get(country)
+
+
+def check_coords_entity_continent(rows: list[dict], **_kw) -> CheckResult:
+    """Flag geographic outliers — assets on a different continent from the entity's majority.
+
+    Uses reverse_geocoder if available, falls back to continent bounding boxes. Warn-only.
+    """
+    result = CheckResult("coords_entity_continent")
+
+    rg = _try_reverse_geocoder()
+
+    def _get_continent(lat: float, lon: float, cc: str = "") -> str | None:
+        # Use country code if available (more accurate)
+        if cc:
+            cc = cc.upper()
+            na = {"US", "CA", "MX", "GT", "HN", "SV", "NI", "CR", "PA", "CU", "DO", "HT", "JM", "TT", "BS", "PR"}
+            sa = {"BR", "AR", "CL", "CO", "PE", "VE", "EC", "BO", "PY", "UY", "GY", "SR"}
+            eu = {"GB", "DE", "FR", "IT", "ES", "NL", "BE", "AT", "CH", "SE", "NO", "DK", "FI",
+                  "PL", "CZ", "PT", "IE", "GR", "HU", "RO", "BG", "HR", "SK", "SI", "LT", "LV", "EE"}
+            af = {"ZA", "EG", "NG", "KE", "ET", "TZ", "GH", "MA", "TN", "DZ", "SN", "CI", "CM"}
+            asia = {"CN", "JP", "KR", "IN", "TW", "SG", "TH", "MY", "ID", "PH", "VN",
+                    "SA", "AE", "IL", "TR", "PK", "BD", "LK", "MM", "KH", "LA"}
+            oc = {"AU", "NZ", "FJ", "PG", "WS", "TO"}
+            if cc in na: return "North America"
+            if cc in sa: return "South America"
+            if cc in eu: return "Europe"
+            if cc in af: return "Africa"
+            if cc in asia: return "Asia"
+            if cc in oc: return "Oceania"
+        # Fallback: bounding box
+        for cname, (min_lat, max_lat, min_lon, max_lon) in CONTINENT_BBOX.items():
+            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                return cname
+        return None
+
+    # Collect all coords for batch reverse geocoding
+    geo_rows = []
+    for i, row in enumerate(rows):
+        entity = row.get("entity_name", "").strip()
+        lat_s = row.get("latitude", "").strip()
+        lon_s = row.get("longitude", "").strip()
+        name = row.get("name", "").strip()
+        if not entity or not lat_s or not lon_s:
+            continue
+        try:
+            lat, lon = float(lat_s), float(lon_s)
+        except ValueError:
+            continue
+        geo_rows.append((i, lat, lon, name, entity))
+
+    if not geo_rows:
+        return result
+
+    # Batch reverse geocode
+    ccs = [""] * len(geo_rows)
+    if rg:
+        coords = [(lat, lon) for _, lat, lon, _, _ in geo_rows]
+        geo_results = rg.search(coords)
+        ccs = [g["cc"] for g in geo_results]
+
+    # Group by entity with continent
+    entity_assets: dict[str, list[tuple[int, str, str]]] = {}  # entity -> [(idx, name, continent)]
+    for (idx, lat, lon, name, entity), cc in zip(geo_rows, ccs):
+        continent = _get_continent(lat, lon, cc)
+        if continent:
+            entity_assets.setdefault(entity, []).append((idx, name, continent))
+
+    from collections import Counter
+    for entity, assets in entity_assets.items():
+        if len(assets) < 3:
+            continue
+
+        continent_counts = Counter(a[2] for a in assets)
+        majority_continent, majority_count = continent_counts.most_common(1)[0]
+
+        if majority_count / len(assets) < 0.6:
+            continue
+
+        for idx, name, continent in assets:
+            if continent != majority_continent:
+                result.warn(
+                    f"Row {idx} '{name}' ({entity}): in {continent} but "
+                    f"{majority_count}/{len(assets)} entity assets are in {majority_continent}"
+                )
+
     return result
 
 
@@ -1731,6 +1961,8 @@ ALL_CHECKS = [
     check_gics_consistency,
     # Phase 3: Data quality
     check_coordinates,
+    check_coords_country_match,
+    check_coords_entity_continent,
     check_address_exists,
     check_entity_stake,
     check_capacity_non_negative,
