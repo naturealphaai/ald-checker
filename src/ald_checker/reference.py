@@ -16,20 +16,90 @@ ALD_COLUMNS = [
 # Extra columns that are acceptable but not part of the core ALD schema
 EXTRA_COLUMNS = {"address", "source_url", "domain_source", "qa_flag"}
 
-VALID_STATUSES = {"Open", "Construction", "Planned", "Cancelled", ""}
+VALID_STATUSES = {
+    "operational",
+    "under construction",
+    "planned",
+    "closed",
+    "mothballed",
+    "temporarily closed",
+    "closing",
+    "under exploration",
+    "",
+}
 
 STATUS_ALIASES: dict[str, str] = {
-    "in operation": "Open",
-    "operating": "Open",
-    "active": "Open",
-    "operational": "Open",
-    "closed": "Cancelled",
-    "shut down": "Cancelled",
-    "decommissioned": "Cancelled",
-    "under construction": "Construction",
-    "proposed": "Planned",
-    "approved": "Planned",
-    "permitted": "Planned",
+    # ALD basefile legacy
+    "open": "operational",
+    "operating": "operational",
+    "active": "operational",
+    "in operation": "operational",
+    "operational": "operational",
+    "construction": "under construction",
+    "under_construction": "under construction",
+    "under development": "under construction",
+    "under construction": "under construction",
+    "planned/under development": "under construction",
+    "operational/under development": "under construction",
+    "pre-construction": "planned",
+    "pre construction": "planned",
+    "proposed": "planned",
+    "announced": "planned",
+    "approved": "planned",
+    "permitted": "planned",
+    "pre-permit": "planned",
+    "planned": "planned",
+    # Closed variants
+    "retired": "closed",
+    "cancelled": "closed",
+    "shut down": "closed",
+    "decommissioned": "closed",
+    # Mothballed / shelved
+    "mothballed": "mothballed",
+    "shelved": "mothballed",
+    "shelved - inferred 2": "mothballed",
+    "cancelled - inferred": "mothballed",
+    # Temporarily closed
+    "temporarily closed": "temporarily closed",
+    "temporarily_closed": "temporarily closed",
+    "idle": "temporarily closed",
+    # Closing / winding down
+    "operating pre-retire": "closing",
+    "mothballed pre-retir": "closing",
+    "closing": "closing",
+    # Exploration / uncertain
+    "under exploration": "under exploration",
+    "uncertain": "under exploration",
+    "unknown": "under exploration",
+    "ramping": "operational",
+}
+
+# Conversion factors between area units (to_sqm multiplier)
+AREA_UNIT_CONVERSIONS: dict[str, float] = {
+    "sqm": 1.0,
+    "sqft": 0.0929,
+    "acres": 4046.86,
+    "hectares": 10000.0,
+}
+
+# Plausibility bounds: (min, max) per capacity_units for a single asset
+CAPACITY_PLAUSIBILITY: dict[str, tuple[float, float]] = {
+    "sqm": (50, 50_000_000),
+    "sqft": (500, 500_000_000),
+    "acres": (0.1, 500_000),
+    "hectares": (0.01, 50_000),
+    "MW": (0.01, 50_000),
+    "MWp": (0.01, 50_000),
+    "GWh": (0.001, 500_000),
+    "GWh/year": (0.001, 500_000),
+    "wafers/month": (100, 500_000),
+    "wafers/year": (1000, 10_000_000),
+    "bpd": (1, 20_000_000),
+    "tons/day": (1, 1_000_000),
+    "TPD": (1, 1_000_000),
+    "MMTPA": (0.01, 500),
+    "rooms": (5, 50_000),
+    "units": (1, 100_000),
 }
 
 

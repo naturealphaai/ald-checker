@@ -11,6 +11,8 @@ from datetime import date
 from pathlib import Path
 
 from ald_checker.reference import (
+    AREA_UNIT_CONVERSIONS,
+    CAPACITY_PLAUSIBILITY,
     EXTRA_COLUMNS,
     STATUS_ALIASES,
     ALD_COLUMNS,
@@ -831,26 +833,52 @@ def check_gics_consistency(rows: list[dict], fix: bool = False, fix_llm: bool = 
 
 
 def check_coordinates(rows: list[dict], **_kw) -> CheckResult:
-    """Lat/lon in valid ranges, not at null island, not swapped."""
+    """Lat/lon in valid ranges, not at null island, not swapped, not in ocean."""
     result = CheckResult("coordinates")
+
+    # Known ocean regions (no land) — conservative boxes
+    OCEAN_BOXES = [
+        # Mid-Pacific (no islands)
+        (10, 40, -170, -130, "mid-Pacific Ocean"),
+        # South Pacific
+        (-60, -30, -170, -90, "South Pacific Ocean"),
+        # Mid-Atlantic (no islands in this band)
+        (10, 35, -60, -20, "mid-Atlantic Ocean"),
+        # South Atlantic
+        (-55, -20, -40, 0, "South Atlantic Ocean"),
+        # Southern Indian Ocean
+        (-60, -35, 30, 100, "Southern Indian Ocean"),
+        # Arctic Ocean
+        (80, 90, -180, 180, "Arctic Ocean"),
+        # Antarctic
+        (-90, -70, -180, 180, "Antarctica/Southern Ocean"),
+    ]
+
     for i, row in enumerate(rows):
         lat_s = row.get("latitude", "").strip()
         lon_s = row.get("longitude", "").strip()
+        name = row.get("name", "").strip()
         if not lat_s or not lon_s:
             continue
         try:
             lat, lon = float(lat_s), float(lon_s)
         except ValueError:
-            result.fail(f"Row {i}: non-numeric coordinates lat='{lat_s}' lon='{lon_s}'")
+            result.fail(f"Row {i} '{name}': non-numeric coordinates lat='{lat_s}' lon='{lon_s}'")
             continue
         if not (-90 <= lat <= 90):
-            result.fail(f"Row {i}: latitude {lat} out of range [-90, 90]")
+            result.fail(f"Row {i} '{name}': latitude {lat} out of range [-90, 90]")
         if not (-180 <= lon <= 180):
-            result.fail(f"Row {i}: longitude {lon} out of range [-180, 180]")
+            result.fail(f"Row {i} '{name}': longitude {lon} out of range [-180, 180]")
         if abs(lat) < 0.01 and abs(lon) < 0.01:
-            result.fail(f"Row {i}: coordinates ({lat}, {lon}) suspiciously near null island")
+            result.fail(f"Row {i} '{name}': coordinates ({lat}, {lon}) suspiciously near null island")
         if (-90 <= lon <= 90) and not (-90 <= lat <= 90) and (-180 <= lat <= 180):
-            result.fail(f"Row {i}: lat={lat}, lon={lon} — possibly swapped?")
+            result.fail(f"Row {i} '{name}': lat={lat}, lon={lon} — possibly swapped?")
+
+        # Ocean check
+        for min_lat, max_lat, min_lon, max_lon, region in OCEAN_BOXES:
+            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                result.fail(f"Row {i} '{name}': ({lat}, {lon}) is in the {region}")
+                break
     return result
 
 
@@ -894,14 +922,202 @@ def check_capacity_non_negative(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
+def check_capacity_plausibility(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Capacity values are plausible for their units.
+
+    Deterministic detection flags implausible values. LLM fix reasons about
+    asset type + name + value + units together to propose corrections — this
+    is critical because capacity/units are tightly coupled and context-dependent.
+    """
+    result = CheckResult("capacity_plausibility")
+
+    # Phase 1: collect implausible rows
+    implausible: list[tuple[int, float, str, str, str]] = []  # (idx, cap, units, name, asset_type)
+    for i, row in enumerate(rows):
+        val_s = row.get("capacity", "").strip()
+        units = row.get("capacity_units", "").strip()
+        name = row.get("name", "").strip()
+        if not val_s or not units:
+            continue
+        try:
+            cap = float(val_s)
+        except ValueError:
+            continue
+        if cap <= 0:
+            continue
+
+        bounds = CAPACITY_PLAUSIBILITY.get(units)
+        if not bounds:
+            continue
+
+        lo, hi = bounds
+        if lo <= cap <= hi:
+            continue
+
+        asset_type = row.get("asset_type_raw", "").strip()
+        implausible.append((i, cap, units, name, asset_type))
+
+    if not implausible:
+        return result
+
+    # Phase 2: report or fix
+    if not fix_llm:
+        # Deterministic hints for diagnostics
+        for idx, cap, units, name, asset_type in implausible:
+            bounds = CAPACITY_PLAUSIBILITY[units]
+            hint = ""
+            if units in AREA_UNIT_CONVERSIONS and cap < bounds[0]:
+                candidates = []
+                for other_unit in AREA_UNIT_CONVERSIONS:
+                    if other_unit == units:
+                        continue
+                    ob = CAPACITY_PLAUSIBILITY.get(other_unit)
+                    if ob and ob[0] <= cap <= ob[1]:
+                        mid = math.sqrt(ob[0] * ob[1])
+                        score = abs(math.log10(cap / mid))
+                        converted = cap * AREA_UNIT_CONVERSIONS[other_unit] / AREA_UNIT_CONVERSIONS[units]
+                        candidates.append((score, other_unit, converted))
+                if candidates:
+                    candidates.sort()
+                    _, best_unit, best_converted = candidates[0]
+                    hint = f" (looks like value is in {best_unit} → should be {best_converted:.1f} {units})"
+            if cap < bounds[0]:
+                result.fail(f"Row {idx} '{name}': capacity={cap} {units} is implausibly small{hint}")
+            else:
+                result.fail(f"Row {idx} '{name}': capacity={cap} {units} is implausibly large")
+        return result
+
+    # Phase 3: LLM fix — send all implausible rows in one batch
+    llm = _try_llm_import()
+    if not llm:
+        result.fail("--fix-llm requires litellm: pip install ald-checker[llm]")
+        return result
+
+    try:
+        corrections = llm.fix_capacity(
+            [
+                {"row": idx, "name": name, "asset_type": asset_type,
+                 "capacity": cap, "capacity_units": units}
+                for idx, cap, units, name, asset_type in implausible
+            ],
+            model=model or llm.DEFAULT_MODEL,
+        )
+        for c in corrections:
+            idx = c["row"]
+            new_cap = c.get("capacity")
+            new_units = c.get("capacity_units")
+            old_cap = rows[idx].get("capacity", "")
+            old_units = rows[idx].get("capacity_units", "")
+            name = rows[idx].get("name", "")
+            if c.get("drop"):
+                rows[idx]["capacity"] = ""
+                rows[idx]["capacity_units"] = ""
+                result.fix(f"Row {idx} '{name}': dropped implausible capacity {old_cap} {old_units}")
+            elif new_cap is not None and new_units:
+                rows[idx]["capacity"] = str(new_cap)
+                rows[idx]["capacity_units"] = new_units
+                result.fix(f"Row {idx} '{name}': {old_cap} {old_units} → {new_cap} {new_units}")
+            else:
+                result.fail(f"Row {idx} '{name}': capacity={old_cap} {old_units} is implausible — LLM could not resolve")
+    except Exception as e:
+        result.fail(f"LLM capacity fix failed: {e}")
+        for idx, cap, units, name, _ in implausible:
+            result.fail(f"Row {idx} '{name}': capacity={cap} {units} is implausible")
+
+    return result
+
+
+def check_capacity_units_appropriate(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Capacity units are semantically appropriate for the asset type and name.
+
+    Catches things like a semiconductor fab measured in sqm instead of wafers/month,
+    or an office measured in MW. Only runs with --fix-llm since this requires reasoning.
+    """
+    result = CheckResult("capacity_units_appropriate")
+
+    if not fix_llm:
+        return result
+
+    # Collect rows that have both capacity and asset type
+    to_check = []
+    for i, row in enumerate(rows):
+        cap = row.get("capacity", "").strip()
+        units = row.get("capacity_units", "").strip()
+        atype = row.get("asset_type_raw", "").strip()
+        name = row.get("name", "").strip()
+        if cap and units and atype:
+            to_check.append({"row": i, "name": name, "asset_type": atype,
+                             "capacity": cap, "capacity_units": units})
+
+    if not to_check:
+        return result
+
+    llm = _try_llm_import()
+    if not llm:
+        return result
+
+    try:
+        flagged = llm.check_capacity_units_appropriate(to_check, model=model or llm.DEFAULT_MODEL)
+        for f in flagged:
+            idx = f["row"]
+            name = rows[idx].get("name", "")
+            old_cap = rows[idx].get("capacity", "")
+            old_units = rows[idx].get("capacity_units", "")
+            issue = f.get("issue", "")
+            new_cap = f.get("capacity")
+            new_units = f.get("capacity_units")
+
+            if issue:
+                result.warn(f"Row {idx} '{name}': capacity={old_cap} {old_units} — {issue}")
+    except Exception as e:
+        result.warn(f"LLM capacity-units-appropriate check failed: {e}")
+
+    return result
+
+
+def _extract_base_status(status: str) -> str:
+    """Extract the base status from a compound status string.
+
+    'operational (P1); under construction (P2-P3)' → 'operational'
+    'under construction (production targeted 2028)' → 'under construction'
+    'ramping (P1 mass production 1H 2026)' → 'ramping'
+    """
+    # Split on semicolon and take first segment, then strip parenthetical
+    first_segment = status.split(";")[0].strip()
+    base = re.split(r"\s*\(", first_segment)[0].strip()
+    return base
+
+
 def check_status_values(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
-    """Status is one of: Open, Construction, Planned, Cancelled."""
+    """Status base value is one of the valid ALD statuses.
+
+    Allows parenthetical detail (e.g. 'operational (P1-P2)') and compound
+    statuses with semicolons (e.g. 'operational (P1); under construction (P2)').
+    The base value (before first parenthetical) must be valid.
+    """
     result = CheckResult("status_values")
     invalid: dict[str, list[int]] = {}
+    needs_casing: list[int] = []
     for i, row in enumerate(rows):
         status = row.get("status", "").strip()
-        if status and status not in VALID_STATUSES:
+        if not status:
+            continue
+        base = _extract_base_status(status)
+        base_lower = base.lower()
+        if base_lower not in VALID_STATUSES:
             invalid.setdefault(status, []).append(i)
+        elif base != base_lower:
+            # Valid but wrong casing (e.g. "Temporarily closed" → "temporarily closed")
+            needs_casing.append(i)
+
+    # Fix casing on valid-but-miscased statuses
+    if needs_casing and (fix or fix_llm):
+        for idx in needs_casing:
+            old = rows[idx]["status"]
+            rows[idx]["status"] = old.lower()
+        result.fix(f"Lowercased {len(needs_casing)} status values")
+    elif needs_casing:
+        result.fail(f"{len(needs_casing)} status values have wrong casing (e.g. '{rows[needs_casing[0]]['status']}')")
 
     if not invalid:
         return result
@@ -913,11 +1129,17 @@ def check_status_values(rows: list[dict], fix: bool = False, fix_llm: bool = Fal
 
     still_invalid: dict[str, list[int]] = {}
     for status, idxs in invalid.items():
-        canonical = STATUS_ALIASES.get(status.lower())
+        base = _extract_base_status(status).lower()
+        canonical = STATUS_ALIASES.get(base)
         if canonical:
+            # Replace only the base portion, preserve parenthetical detail
             for idx in idxs:
-                rows[idx]["status"] = canonical
-            result.fix(f"'{status}' → '{canonical}' at {len(idxs)} rows")
+                old_status = rows[idx]["status"]
+                new_status = old_status.replace(
+                    _extract_base_status(old_status), canonical, 1
+                )
+                rows[idx]["status"] = new_status
+            result.fix(f"'{status}' base → '{canonical}' at {len(idxs)} rows")
         else:
             still_invalid[status] = idxs
 
@@ -1298,7 +1520,11 @@ def check_isin_format(rows: list[dict], **_kw) -> CheckResult:
 
 
 def check_capacity_units_consistency(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
-    """Same asset_type_raw has consistent capacity_units. Warns on mixed units, LLM can normalize."""
+    """Same asset_type_raw has consistent capacity_units.
+
+    Warns on mixed units. LLM fix converts BOTH the value and units together —
+    never change units without converting the value.
+    """
     result = CheckResult("capacity_units_consistency")
     mapping: dict[str, dict[str, list[int]]] = {}
     for i, row in enumerate(rows):
@@ -1313,23 +1539,51 @@ def check_capacity_units_consistency(rows: list[dict], fix_llm: bool = False, mo
         if len(units_map) > 1:
             counts = {u: len(idxs) for u, idxs in units_map.items()}
             result.warn(f"'{raw}' has mixed capacity_units: {counts}")
-            mixed[raw] = list(units_map.keys())
+            mixed[raw] = units_map
 
-    # LLM normalize if requested
-    if mixed and fix_llm:
-        llm = _try_llm_import()
-        if llm:
-            try:
-                normalized = llm.standardize_capacity_units(mixed, model=model or llm.DEFAULT_MODEL)
-                for orig, std in normalized.items():
-                    if orig != std:
-                        for raw, units_map in mapping.items():
-                            if orig in units_map:
-                                for idx in units_map[orig]:
-                                    rows[idx]["capacity_units"] = std
-                                result.fix(f"Capacity units: '{orig}' → '{std}'")
-            except Exception:
-                pass
+    if not mixed or not fix_llm:
+        return result
+
+    # Collect minority-unit rows that need conversion
+    to_fix = []
+    for raw, units_map in mixed.items():
+        majority_unit = max(units_map, key=lambda u: len(units_map[u]))
+        for unit, idxs in units_map.items():
+            if unit == majority_unit:
+                continue
+            for idx in idxs:
+                to_fix.append({
+                    "row": idx,
+                    "name": rows[idx].get("name", ""),
+                    "asset_type": raw,
+                    "capacity": rows[idx].get("capacity", ""),
+                    "capacity_units": unit,
+                    "target_units": majority_unit,
+                })
+
+    if not to_fix:
+        return result
+
+    llm = _try_llm_import()
+    if not llm:
+        return result
+
+    try:
+        corrections = llm.convert_capacity_units(to_fix, model=model or llm.DEFAULT_MODEL)
+        for c in corrections:
+            idx = c["row"]
+            old_cap = rows[idx].get("capacity", "")
+            old_units = rows[idx].get("capacity_units", "")
+            new_cap = c.get("capacity")
+            new_units = c.get("capacity_units")
+            name = rows[idx].get("name", "")
+            if new_cap is not None and new_units:
+                rows[idx]["capacity"] = str(new_cap)
+                rows[idx]["capacity_units"] = new_units
+                result.fix(f"Row {idx} '{name}': {old_cap} {old_units} → {new_cap} {new_units}")
+    except Exception as e:
+        result.warn(f"LLM capacity unit conversion failed: {e}")
+
     return result
 
 
@@ -1480,6 +1734,8 @@ ALL_CHECKS = [
     check_address_exists,
     check_entity_stake,
     check_capacity_non_negative,
+    check_capacity_plausibility,
+    check_capacity_units_appropriate,
     check_status_values,
     check_required_fields,
     check_name_casing,

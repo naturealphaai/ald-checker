@@ -45,9 +45,11 @@ def standardize_raw_types(raw_types: list[str], model: str = DEFAULT_MODEL) -> d
         "- Preserve spacing around & (e.g. 'museum & visitor center' stays as is)\n\n"
         f"Asset types to standardize:\n{items}\n\n"
         'Respond with JSON only: {{"original": "standardized", ...}}\n'
-        "Only include entries that changed. Omit unchanged ones."
+        "Only include entries that changed. Omit unchanged ones. "
+        "If nothing changed, respond with {}"
     )
-    return json.loads(_strip_fences(_llm_classify(prompt, model)))
+    raw = _strip_fences(_llm_classify(prompt, model)).strip()
+    return json.loads(raw) if raw else {}
 
 
 def classify_naturesense(raw_types: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
@@ -150,6 +152,119 @@ def parse_dates(dates: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
     return json.loads(_strip_fences(_llm_classify(prompt, model)))
 
 
+def fix_capacity(assets: list[dict], model: str = DEFAULT_MODEL) -> list[dict]:
+    """Fix implausible capacity + capacity_units pairs via LLM.
+
+    Each asset dict has: row, name, asset_type, capacity, capacity_units.
+    Returns list of corrections: {row, capacity, capacity_units} or {row, drop: true}.
+    """
+    items = "\n".join(
+        f"- Row {a['row']}: \"{a['name']}\" (type: {a['asset_type'] or 'unknown'}), "
+        f"capacity={a['capacity']}, units={a['capacity_units']}"
+        for a in assets
+    )
+    prompt = (
+        "These assets have implausible capacity values for their units. "
+        "For each one, determine the correct capacity and capacity_units.\n\n"
+        "Common errors:\n"
+        "- Unit was changed (e.g. hectares→sqm) but the value wasn't converted "
+        "(7 hectares = 70000 sqm, so 7 sqm is wrong)\n"
+        "- Wrong unit entirely (e.g. sqm for a power plant should be MW)\n"
+        "- Decimal point error (e.g. 0.5 MW should be 500 kW, reported as 500 MW)\n\n"
+        "Use the asset name and type to reason about what the correct capacity and "
+        "units should be. If you cannot determine the correct value with confidence, "
+        'set "drop": true to clear the capacity rather than guessing.\n\n'
+        f"Assets to fix:\n{items}\n\n"
+        "Respond with JSON array: "
+        '[{{"row": N, "capacity": X, "capacity_units": "unit"}} or '
+        '{{"row": N, "drop": true}}, ...]'
+    )
+    raw = json.loads(_strip_fences(_llm_classify(prompt, model)))
+    return raw if isinstance(raw, list) else []
+
+
+def check_capacity_units_appropriate(assets: list[dict], model: str = DEFAULT_MODEL) -> list[dict]:
+    """Check if capacity units are semantically appropriate for the asset type.
+
+    Returns only rows where units are wrong for the asset type, with corrections.
+    """
+    # Batch in chunks of 30
+    results = []
+    for i in range(0, len(assets), 30):
+        batch = assets[i:i+30]
+        items = "\n".join(
+            f"- Row {a['row']}: \"{a['name']}\" (type: {a['asset_type']}), "
+            f"capacity={a['capacity']} {a['capacity_units']}"
+            for a in batch
+        )
+        prompt = (
+            "Review each asset's capacity units and determine if they are semantically "
+            "appropriate for the asset type and name.\n\n"
+            "CRITICAL CONTEXT: Capacity can represent EITHER:\n"
+            "- Building/site size (sqm, sqft, hectares, acres) — how big the physical asset is\n"
+            "- Production throughput (wafers/month, MW, tons/day, bpd) — what the asset produces\n"
+            "Both are valid for the same asset. A fab with 96000 sqm is its building footprint. "
+            "A fab with 100000 wafers/month is its production capacity. Neither is wrong.\n\n"
+            "Examples of CLEARLY WRONG units (flag these):\n"
+            "- Office with capacity in MW or wafers/month\n"
+            "- Power plant with capacity in rooms or sqm\n"
+            "- Warehouse with capacity in wafers/month or MW\n"
+            "- Childcare facility with capacity in bpd or MW\n\n"
+            "Examples of CORRECT/ACCEPTABLE units (do NOT flag):\n"
+            "- Any industrial facility (fab, factory, plant, packaging) in sqm/sqft/hectares/acres = building footprint. ALWAYS acceptable.\n"
+            "- Semiconductor fab in wafers/month or wafers/year = production capacity. Also acceptable.\n"
+            "- Office/housing in sqm, sqft, units, or rooms\n"
+            "- Power plant/solar/wind in MW, MWp, GWh/year\n"
+            "- Water treatment in tons/day, m3/day, or acres\n\n"
+            "IMPORTANT: Area units (sqm, sqft, hectares, acres) are ALWAYS valid for ANY "
+            "physical asset as they can represent building footprint or site area. "
+            "Only flag units that are CLEARLY from the wrong domain (e.g. energy units on "
+            "an office, production throughput on a warehouse).\n\n"
+            "ONLY return rows where units are OBVIOUSLY wrong. When in doubt, do NOT flag.\n\n"
+            f"Assets to review:\n{items}\n\n"
+            "Respond with JSON array of ONLY problematic rows: "
+            '[{{"row": N, "issue": "brief explanation", '
+            '"capacity": corrected_value_or_null, "capacity_units": "corrected_unit_or_null", '
+            '"drop": true_if_should_clear}}, ...]\n'
+            "Return [] if all units are appropriate."
+        )
+        try:
+            raw = json.loads(_strip_fences(_llm_classify(prompt, model)).strip() or "[]")
+            if isinstance(raw, list):
+                results.extend(raw)
+        except Exception:
+            pass
+    return results
+
+
+def convert_capacity_units(assets: list[dict], model: str = DEFAULT_MODEL) -> list[dict]:
+    """Convert capacity values when changing units for consistency.
+
+    Each asset dict has: row, name, asset_type, capacity, capacity_units, target_units.
+    Returns list of: {row, capacity, capacity_units} with the converted value.
+    """
+    items = "\n".join(
+        f"- Row {a['row']}: \"{a['name']}\" (type: {a['asset_type']}), "
+        f"capacity={a['capacity']} {a['capacity_units']} → convert to {a['target_units']}"
+        for a in assets
+    )
+    prompt = (
+        "Convert each asset's capacity value from its current units to the target units.\n\n"
+        "CRITICAL: You must convert the numeric VALUE, not just change the label.\n"
+        "For example:\n"
+        "- 7 hectares → 70000 sqm (multiply by 10000)\n"
+        "- 15 acres → 60702.9 sqm (multiply by 4046.86)\n"
+        "- 100000 wafers/month → 1200000 wafers/year (multiply by 12)\n\n"
+        "If a conversion doesn't make sense for the asset type (e.g. converting "
+        "acres to tons/day for a water plant), keep the original value and units.\n\n"
+        f"Assets to convert:\n{items}\n\n"
+        "Respond with JSON array: "
+        '[{{"row": N, "capacity": X, "capacity_units": "unit"}}, ...]'
+    )
+    raw = json.loads(_strip_fences(_llm_classify(prompt, model)))
+    return raw if isinstance(raw, list) else []
+
+
 def standardize_capacity_units(units_with_types: dict[str, list[str]], model: str = DEFAULT_MODEL) -> dict[str, str]:
     """Normalize capacity units. Input: {asset_type: [unit1, unit2, ...]}. Returns {original_unit: standardized_unit}."""
     items = "\n".join(f"- {t}: {', '.join(units)}" for t, units in units_with_types.items())
@@ -167,11 +282,17 @@ def classify_status(statuses: list[str], model: str = DEFAULT_MODEL) -> dict[str
     """Normalize free-text status values via LLM."""
     items = "\n".join(f"- {s}" for s in statuses)
     prompt = (
-        "Normalize each asset status into exactly one of: Open, Construction, Planned, Cancelled.\n\n"
-        "- Open = currently active/operating\n"
-        "- Construction = being built\n"
-        "- Planned = approved/permitted but not started\n"
-        "- Cancelled = shut down/decommissioned/closed\n\n"
+        "Normalize each asset status into exactly one of these canonical values:\n"
+        "operational, under construction, planned, closed, mothballed, "
+        "temporarily closed, closing, under exploration\n\n"
+        "- operational = currently active, operating, open, ramping up\n"
+        "- under construction = being built, under development, in development\n"
+        "- planned = approved/permitted/announced/proposed but construction not started\n"
+        "- closed = permanently shut down, retired, decommissioned, cancelled\n"
+        "- mothballed = indefinitely paused/shelved, could potentially restart\n"
+        "- temporarily closed = short-term closure (seasonal, maintenance, idle)\n"
+        "- closing = in the process of winding down, pre-retirement\n"
+        "- under exploration = exploratory phase, status unknown or uncertain\n\n"
         f"Statuses to normalize:\n{items}\n\n"
         'Respond with JSON only: {{"original status": "canonical status", ...}}'
     )
