@@ -1577,14 +1577,14 @@ def check_supplementary_details(rows: list[dict], fix: bool = False, **_kw) -> C
     return result
 
 
-def check_notes_contradict_columns(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+def check_json_contradict_columns(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
     """Supplementary details / notes should not contradict status, asset type, or other columns.
 
     Catches things like notes saying 'under construction' when status is 'operational',
     or notes saying 'warehouse' when asset type is 'office'. Warn-only — LLM reviews
     rows where notes contain status/type keywords that conflict with column values.
     """
-    result = CheckResult("notes_contradict_columns")
+    result = CheckResult("json_contradict_columns")
 
     # Phase 1: deterministic pre-filter — find rows where notes mention status-like words
     # that differ from the actual status column
@@ -2116,7 +2116,7 @@ ALL_CHECKS = [
     check_name_casing,
     check_entity_name_casing,
     check_supplementary_details,
-    check_notes_contradict_columns,
+    check_json_contradict_columns,
     check_date_researched,
     check_isin_format,
     check_capacity_units_consistency,
