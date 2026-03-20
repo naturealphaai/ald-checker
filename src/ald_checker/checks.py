@@ -366,11 +366,15 @@ def check_naturesense_correct(rows: list[dict], fix: bool = False, fix_llm: bool
                 ns_results = llm.classify_naturesense(raw_list, model=model)
                 for raw, ns_result in ns_results.items():
                     if raw in unknown_raw and ns_result in VALID_NATURESENSE:
+                        # Only report as fixed if we actually changed something
+                        changed_count = 0
                         for idx in unknown_raw[raw]:
-                            rows[idx]["naturesense_asset_type"] = ns_result
-                        result.fix(f"LLM: '{raw}' → NS='{ns_result}' at {len(unknown_raw[raw])} rows")
-                        # Don't save to mapping table here — GICS hasn't been classified yet
-                        # check_gics_correct will save the full mapping after GICS is determined
+                            current = rows[idx].get("naturesense_asset_type", "").strip()
+                            if current != ns_result:
+                                rows[idx]["naturesense_asset_type"] = ns_result
+                                changed_count += 1
+                        if changed_count:
+                            result.fix(f"LLM: '{raw}' → NS='{ns_result}' at {changed_count} rows")
             except Exception:
                 pass
 
@@ -433,9 +437,14 @@ def check_gics_correct(rows: list[dict], fix: bool = False, fix_llm: bool = Fals
                 gics_results = llm.classify_gics(raw_list, model=model)
                 for raw, gics_result in gics_results.items():
                     if raw in unknown_raw and gics_result in VALID_GICS:
+                        changed_count = 0
                         for idx in unknown_raw[raw]:
-                            rows[idx]["industry_code"] = gics_result
-                        result.fix(f"LLM: '{raw}' → GICS='{gics_result}' at {len(unknown_raw[raw])} rows")
+                            current = str(rows[idx].get("industry_code", "")).strip()
+                            if current != gics_result:
+                                rows[idx]["industry_code"] = gics_result
+                                changed_count += 1
+                        if changed_count:
+                            result.fix(f"LLM: '{raw}' → GICS='{gics_result}' at {changed_count} rows")
                         ns = rows[unknown_raw[raw][0]].get("naturesense_asset_type", "")
                         if ns:
                             _save_type_mapping(raw, ns, gics_result, "llm")
@@ -1778,9 +1787,9 @@ def check_duplicate_assets(rows: list[dict], **_kw) -> CheckResult:
 
 
 def check_date_researched(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
-    """date_researched is a valid YYYY-MM-DD date."""
+    """date_researched is a valid date (YYYY-MM-DD or DD/MM/YYYY)."""
     result = CheckResult("date_researched")
-    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$|^\d{2}/\d{2}/\d{4}$")
     today = date.today().isoformat()
 
     empty = [i for i, r in enumerate(rows) if not r.get("date_researched", "").strip()]
