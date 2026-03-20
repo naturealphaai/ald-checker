@@ -2167,6 +2167,31 @@ ALL_CHECKS = [
 ]
 
 
+def _read_input(path: Path) -> tuple[list[str], list[dict]]:
+    """Read CSV or XLSX file. Returns (headers, rows)."""
+    if path.suffix.lower() == ".xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        # Find the Assets sheet, or use the first/active sheet
+        ws = wb["Assets"] if "Assets" in wb.sheetnames else wb.active
+        row_iter = ws.iter_rows(values_only=True)
+        headers = [str(h) if h else "" for h in next(row_iter)]
+        rows = []
+        for vals in row_iter:
+            row = {}
+            for h, v in zip(headers, vals):
+                row[h] = str(v) if v is not None else ""
+            rows.append(row)
+        wb.close()
+        return headers, rows
+    else:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            headers = list(reader.fieldnames or [])
+            rows = list(reader)
+        return headers, rows
+
+
 def run_checks(
     csv_path: str,
     fix: bool = False,
@@ -2177,15 +2202,12 @@ def run_checks(
     no_xlsx: bool = False,
     dry_run: bool = False,
 ) -> list[CheckResult]:
-    """Run all checks on a CSV file. Returns list of CheckResults."""
+    """Run all checks on a CSV or XLSX file. Returns list of CheckResults."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"{path} not found")
 
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        headers = list(reader.fieldnames or [])
-        rows = list(reader)
+    headers, rows = _read_input(path)
 
     # Apply config defaults
     if not model:
@@ -2249,25 +2271,7 @@ def run_checks(
             r.get("name", "").lower(),
         ))
 
-        # Write CSV — use headers which may have been updated by check_columns
-        # Also include any extra columns that were added during fixes
-        all_keys = set()
-        for row in rows:
-            all_keys.update(row.keys())
-        out_headers = [h for h in headers if h in all_keys]
-        for k in all_keys:
-            if k not in out_headers and k:
-                out_headers.append(k)
-
-        suffix = CONFIG.get("output", {}).get("suffix", "_checked")
-        csv_out = path.with_stem(path.stem + suffix)
-        with csv_out.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=out_headers, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"\n  Fixed CSV written to: {csv_out}")
-
-        # Write xlsx with Key + Assets + Review tabs
+        # Write xlsx with Key + Assets + Audit tabs
         try:
             if no_xlsx:
                 raise ImportError("xlsx disabled")
