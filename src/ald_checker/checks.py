@@ -1919,9 +1919,10 @@ def check_capacity_units_consistency(rows: list[dict], fix_llm: bool = False, mo
             new_units = c.get("capacity_units")
             name = rows[idx].get("name", "")
             if new_cap is not None and new_units:
-                rows[idx]["capacity"] = str(new_cap)
-                rows[idx]["capacity_units"] = new_units
-                result.fix(f"Row {idx} '{name}': {old_cap} {old_units} → {new_cap} {new_units}")
+                if str(new_cap) != str(old_cap) or new_units != old_units:
+                    rows[idx]["capacity"] = str(new_cap)
+                    rows[idx]["capacity_units"] = new_units
+                    result.fix(f"Row {idx} '{name}': {old_cap} {old_units} → {new_cap} {new_units}")
     except Exception as e:
         result.warn(f"LLM capacity unit conversion failed: {e}")
 
