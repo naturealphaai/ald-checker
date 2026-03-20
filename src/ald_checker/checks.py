@@ -1328,35 +1328,62 @@ def _extract_base_status(status: str) -> str:
 
 
 def check_status_values(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
-    """Status base value is one of the valid ALD statuses.
+    """Status must be exactly one of the 9 canonical values — no extra text.
 
-    Allows parenthetical detail (e.g. 'operational (P1-P2)') and compound
-    statuses with semicolons (e.g. 'operational (P1); under construction (P2)').
-    The base value (before first parenthetical) must be valid.
+    Valid: operational, under construction, planned, closed, mothballed,
+    temporarily closed, closing, under exploration.
+    On fix: strips to canonical keyword, moves any detail to supplementary_details.
     """
     result = CheckResult("status_values")
     invalid: dict[str, list[int]] = {}
     needs_casing: list[int] = []
+    has_extra: list[int] = []
+
     for i, row in enumerate(rows):
         status = row.get("status", "").strip()
         if not status:
             continue
-        base = _extract_base_status(status)
-        base_lower = base.lower()
-        if base_lower not in VALID_STATUSES:
-            invalid.setdefault(status, []).append(i)
-        elif base != base_lower:
-            # Valid but wrong casing (e.g. "Temporarily closed" → "temporarily closed")
-            needs_casing.append(i)
+        status_lower = status.lower()
 
-    # Fix casing on valid-but-miscased statuses
+        if status_lower in VALID_STATUSES:
+            if status != status_lower:
+                needs_casing.append(i)
+        else:
+            # Check if base is valid but has extra detail
+            base = _extract_base_status(status).lower()
+            if base in VALID_STATUSES and status_lower != base:
+                has_extra.append(i)
+            else:
+                invalid.setdefault(status, []).append(i)
+
+    # Fix casing
     if needs_casing and (fix or fix_llm):
         for idx in needs_casing:
-            old = rows[idx]["status"]
-            rows[idx]["status"] = old.lower()
+            rows[idx]["status"] = rows[idx]["status"].lower()
         result.fix(f"Lowercased {len(needs_casing)} status values")
     elif needs_casing:
         result.fail(f"{len(needs_casing)} status values have wrong casing (e.g. '{rows[needs_casing[0]]['status']}')")
+
+    # Fix statuses with extra detail — strip to base, move detail to supp
+    if has_extra and (fix or fix_llm):
+        for idx in has_extra:
+            old_status = rows[idx]["status"]
+            base = _extract_base_status(old_status).lower()
+            # Move full status detail to supplementary_details
+            sd = rows[idx].get("supplementary_details", "").strip()
+            try:
+                parsed = json.loads(sd) if sd else {}
+            except (json.JSONDecodeError, ValueError):
+                parsed = {}
+            existing_notes = parsed.get("notes", "")
+            detail = f"Status detail: {old_status}"
+            parsed["notes"] = f"{existing_notes}; {detail}" if existing_notes else detail
+            rows[idx]["supplementary_details"] = json.dumps(parsed)
+            rows[idx]["status"] = base
+        result.fix(f"Stripped {len(has_extra)} statuses to base keyword (detail moved to supplementary_details)")
+    elif has_extra:
+        samples = [rows[i]["status"] for i in has_extra[:3]]
+        result.fail(f"{len(has_extra)} statuses have extra detail beyond keyword: {samples}")
 
     if not invalid:
         return result
@@ -1371,14 +1398,22 @@ def check_status_values(rows: list[dict], fix: bool = False, fix_llm: bool = Fal
         base = _extract_base_status(status).lower()
         canonical = STATUS_ALIASES.get(base)
         if canonical:
-            # Replace only the base portion, preserve parenthetical detail
             for idx in idxs:
                 old_status = rows[idx]["status"]
-                new_status = old_status.replace(
-                    _extract_base_status(old_status), canonical, 1
-                )
-                rows[idx]["status"] = new_status
-            result.fix(f"'{status}' base → '{canonical}' at {len(idxs)} rows")
+                if old_status.lower() != canonical:
+                    # Move any extra detail to supp
+                    if len(old_status) > len(canonical) + 2:
+                        sd = rows[idx].get("supplementary_details", "").strip()
+                        try:
+                            parsed = json.loads(sd) if sd else {}
+                        except (json.JSONDecodeError, ValueError):
+                            parsed = {}
+                        existing_notes = parsed.get("notes", "")
+                        detail = f"Status detail: {old_status}"
+                        parsed["notes"] = f"{existing_notes}; {detail}" if existing_notes else detail
+                        rows[idx]["supplementary_details"] = json.dumps(parsed)
+                rows[idx]["status"] = canonical
+            result.fix(f"'{status}' → '{canonical}' at {len(idxs)} rows")
         else:
             still_invalid[status] = idxs
 
