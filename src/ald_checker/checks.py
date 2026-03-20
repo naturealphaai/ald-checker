@@ -1568,6 +1568,108 @@ def check_supplementary_details(rows: list[dict], fix: bool = False, **_kw) -> C
     return result
 
 
+def check_notes_contradict_columns(rows: list[dict], fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Supplementary details / notes should not contradict status, asset type, or other columns.
+
+    Catches things like notes saying 'under construction' when status is 'operational',
+    or notes saying 'warehouse' when asset type is 'office'. Warn-only — LLM reviews
+    rows where notes contain status/type keywords that conflict with column values.
+    """
+    result = CheckResult("notes_contradict_columns")
+
+    # Phase 1: deterministic pre-filter — find rows where notes mention status-like words
+    # that differ from the actual status column
+    STATUS_WORDS = {
+        "closed": {"closed", "closing"},
+        "under construction": {"under construction"},
+        "planned": {"planned"},
+        "suspended": {"suspended", "mothballed"},
+        "temporarily closed": {"temporarily closed", "temporary closure"},
+    }
+
+    candidates = []
+    for i, row in enumerate(rows):
+        sd = row.get("supplementary_details", "").strip()
+        if not sd:
+            continue
+        try:
+            parsed = json.loads(sd)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        text_parts = []
+        for key in ("notes", "note", "location_description"):
+            v = parsed.get(key, "")
+            if isinstance(v, str) and v:
+                text_parts.append(v)
+        if not text_parts:
+            continue
+
+        notes_text = " ".join(text_parts).lower()
+        status = row.get("status", "").strip().lower()
+        name = row.get("name", "").strip()
+        atype = row.get("asset_type_raw", "").strip().lower()
+
+        # Skip notes containing "not closed", "undisclosed", etc.
+        cleaned_notes = notes_text.replace("undisclosed", "").replace("not closed", "")
+
+        for status_word, variants in STATUS_WORDS.items():
+            if any(v in cleaned_notes for v in variants):
+                # Check if this conflicts with actual status
+                if status_word not in status and not any(v in status for v in variants):
+                    candidates.append((i, name, status, atype, notes_text[:200]))
+                    break
+
+    if not candidates:
+        return result
+
+    if not fix_llm:
+        for idx, name, status, atype, notes in candidates:
+            result.warn(f"Row {idx} '{name}': notes may contradict status='{status}' — review needed")
+        return result
+
+    # Phase 2: LLM verifies actual contradictions
+    llm = _try_llm_import()
+    if not llm:
+        for idx, name, status, atype, notes in candidates:
+            result.warn(f"Row {idx} '{name}': notes may contradict status='{status}'")
+        return result
+
+    try:
+        items = "\n".join(
+            f"- Row {idx}: name=\"{name}\", status=\"{status}\", type=\"{atype}\", "
+            f"notes=\"{notes[:150]}\""
+            for idx, name, status, atype, notes in candidates
+        )
+        prompt = (
+            "Review each asset row. The notes/supplementary details may contradict "
+            "the status or asset_type columns.\n\n"
+            "For each row, determine if there is a REAL contradiction:\n"
+            "- 'under construction' in notes + status='operational' → CONTRADICTION\n"
+            "- 'temporary office' in notes + status='operational' → NOT a contradiction (temporary describes the office, not the status)\n"
+            "- 'NOT closed — still active' → NOT a contradiction\n"
+            "- 'undisclosed address' → NOT a contradiction (contains 'closed' but not about status)\n\n"
+            f"Rows to check:\n{items}\n\n"
+            "Respond with JSON array of ONLY rows with REAL contradictions:\n"
+            '[{{"row": N, "issue": "brief description of contradiction"}}, ...]\n'
+            "Return [] if no real contradictions."
+        )
+        raw = json.loads(llm._strip_fences(llm._llm_classify(prompt, model or llm.DEFAULT_MODEL)).strip() or "[]")
+        if isinstance(raw, list):
+            for item in raw:
+                idx = item.get("row")
+                issue = item.get("issue", "")
+                if idx is not None:
+                    name = rows[idx].get("name", "") if idx < len(rows) else "?"
+                    result.warn(f"Row {idx} '{name}': {issue}")
+    except Exception as e:
+        result.warn(f"LLM notes contradiction check failed: {e}")
+        for idx, name, status, atype, notes in candidates:
+            result.warn(f"Row {idx} '{name}': notes may contradict status='{status}'")
+
+    return result
+
+
 def check_entity_parent_consistency(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
     """Same entity_name always maps to same parent_name and parent_isin."""
     result = CheckResult("entity_parent_consistency")
@@ -2005,6 +2107,7 @@ ALL_CHECKS = [
     check_name_casing,
     check_entity_name_casing,
     check_supplementary_details,
+    check_notes_contradict_columns,
     check_date_researched,
     check_isin_format,
     check_capacity_units_consistency,
