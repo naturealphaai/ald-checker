@@ -1607,8 +1607,7 @@ def check_notes_contradict_columns(rows: list[dict], fix_llm: bool = False, mode
             continue
 
         text_parts = []
-        for key in ("notes", "note", "location_description"):
-            v = parsed.get(key, "")
+        for key, v in parsed.items():
             if isinstance(v, str) and v:
                 text_parts.append(v)
         if not text_parts:
