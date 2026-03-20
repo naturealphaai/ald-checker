@@ -125,6 +125,38 @@ def map_columns(unknown_cols: list[str], known_cols: list[str], model: str = DEF
     return json.loads(_strip_fences(_llm_classify(prompt, model)))
 
 
+def find_entity_name_duplicates(names: list[str], model: str = DEFAULT_MODEL) -> dict[str, list[str]]:
+    """Find entity names that refer to the same legal entity.
+
+    Returns {canonical_name: [variant1, variant2, ...]} for groups that should merge.
+    Does NOT merge different subsidiaries that share a parent name.
+    """
+    items = "\n".join(f"- {n}" for n in names)
+    prompt = (
+        "These are entity names from an asset database. Some may refer to the same "
+        "legal entity written differently (typos, abbreviation differences).\n\n"
+        "MERGE these (same legal entity, just written differently):\n"
+        "- 'Atlas Copco (India) Ltd' and 'Atlas Copco (India) Ltd.' — same entity\n"
+        "- 'Edwards Vacuum' and 'Edwards Vacuum LLC' — same entity\n"
+        "- 'Samsung Electronics' and 'Samsung Electronics Co., Ltd.' — same entity\n\n"
+        "DO NOT MERGE these (different legal entities/subsidiaries):\n"
+        "- 'Atlas Copco AB' and 'Atlas Copco K.K.' — different entities (Sweden vs Japan)\n"
+        "- 'Atlas Copco AB' and 'Atlas Copco s.r.o.' — different entities (Sweden vs Czech)\n"
+        "- 'TSMC' and 'TSMC Arizona Corporation' — different entities (parent vs subsidiary)\n"
+        "- 'Samsung Electronics' and 'Samsung SDI' — different companies\n\n"
+        "Key rule: If the names differ ONLY in legal suffix (Ltd/Ltd./LLC/Inc/Co./Corp) "
+        "or punctuation, they are the same entity. If they have different geographic or "
+        "business identifiers (country names, K.K., s.r.o., GmbH with different base names), "
+        "they are DIFFERENT entities.\n\n"
+        f"Entity names:\n{items}\n\n"
+        "Respond with JSON: {{\"canonical_name\": [\"variant1\", \"variant2\"], ...}}\n"
+        "Only include groups where merging is needed. Use the most complete/common form "
+        "as the canonical name. Return {} if no merges needed."
+    )
+    raw = _strip_fences(_llm_classify(prompt, model)).strip()
+    return json.loads(raw) if raw else {}
+
+
 def standardize_attribution(sources: list[str], model: str = DEFAULT_MODEL) -> dict[str, str]:
     """Standardize attribution source values via LLM."""
     items = "\n".join(f"- {s}" for s in sources)

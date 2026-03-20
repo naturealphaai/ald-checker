@@ -1828,41 +1828,73 @@ def check_source_url_format(rows: list[dict], **_kw) -> CheckResult:
     return result
 
 
-def check_entity_name_consistency(rows: list[dict], fix: bool = False, **_kw) -> CheckResult:
-    """Entity names that resolve to the same base name are written the same way.
+def check_entity_name_consistency(rows: list[dict], fix: bool = False, fix_llm: bool = False, model: str = "", **_kw) -> CheckResult:
+    """Entity names that are the same legal entity should be written the same way.
 
-    Uses cleanco to strip legal suffixes (Inc., Ltd., GmbH, A/S, etc.)
-    and groups by base name. Majority form wins on --fix.
+    Uses LLM to determine which names are the same entity vs different subsidiaries.
+    E.g. 'Atlas Copco (India) Ltd' and 'Atlas Copco (India) Ltd.' are the same entity,
+    but 'Atlas Copco AB' and 'Atlas Copco K.K.' are different entities.
     """
-    from cleanco import basename
-
     result = CheckResult("entity_name_consistency")
-    base_to_forms: dict[str, dict[str, list[int]]] = {}
+
+    # Collect unique entity names with counts
+    name_rows: dict[str, list[int]] = {}
     for i, row in enumerate(rows):
         name = row.get("entity_name", "").strip()
-        if not name:
-            continue
-        base = basename(name).strip().lower()
-        if not base:
-            continue
-        base_to_forms.setdefault(base, {}).setdefault(name, []).append(i)
+        if name:
+            name_rows.setdefault(name, []).append(i)
 
-    for base, forms in base_to_forms.items():
-        if len(forms) <= 1:
-            continue
-        counts = {form: len(idxs) for form, idxs in forms.items()}
-        if fix:
-            winner = max(forms, key=lambda f: len(forms[f]))
+    unique_names = list(name_rows.keys())
+    if len(unique_names) <= 1:
+        return result
+
+    if not fix_llm:
+        # Without LLM, only flag exact-match-after-lowering duplicates
+        lower_groups: dict[str, dict[str, list[int]]] = {}
+        for name, idxs in name_rows.items():
+            key = name.lower().strip()
+            lower_groups.setdefault(key, {}).setdefault(name, []).extend(idxs)
+        for key, forms in lower_groups.items():
+            if len(forms) > 1:
+                counts = {f: len(idx) for f, idx in forms.items()}
+                if fix:
+                    winner = max(forms, key=lambda f: len(forms[f]))
+                    fixed = 0
+                    for form, idxs in forms.items():
+                        if form != winner:
+                            for idx in idxs:
+                                rows[idx]["entity_name"] = winner
+                            fixed += len(idxs)
+                    if fixed:
+                        result.fix(f"Case normalized to '{winner}' (was {counts}, fixed {fixed} rows)")
+                else:
+                    result.fail(f"Same entity, different casing: {counts}")
+        return result
+
+    # LLM: ask which names refer to the same legal entity
+    llm = _try_llm_import()
+    if not llm:
+        result.fail("--fix-llm requires litellm")
+        return result
+
+    try:
+        merges = llm.find_entity_name_duplicates(unique_names, model=model or llm.DEFAULT_MODEL)
+        for canonical, variants in merges.items():
+            if canonical not in name_rows:
+                continue
             fixed_count = 0
-            for form, idxs in forms.items():
-                if form != winner:
-                    for idx in idxs:
-                        rows[idx]["entity_name"] = winner
-                    fixed_count += len(idxs)
+            merged_from = {}
+            for variant in variants:
+                if variant in name_rows and variant != canonical:
+                    merged_from[variant] = len(name_rows[variant])
+                    for idx in name_rows[variant]:
+                        rows[idx]["entity_name"] = canonical
+                    fixed_count += len(name_rows[variant])
             if fixed_count:
-                result.fix(f"Normalized to '{winner}' (was {counts}, fixed {fixed_count} rows)")
-        else:
-            result.fail(f"Same entity written as: {counts}")
+                result.fix(f"'{canonical}' ← {merged_from} ({fixed_count} rows)")
+    except Exception as e:
+        result.warn(f"LLM entity name consistency failed: {e}")
+
     return result
 
 
